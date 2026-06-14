@@ -1,5 +1,7 @@
 # Environment variables
 .env
+.env.*
+!.env.example
 
 # Python artifacts
 __pycache__/
@@ -15,3 +17,6 @@ venv/
 *.sqlite
 *.sqlite3
 investment_data.db
+
+# OS files
+.DS_Store
