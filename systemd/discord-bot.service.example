@@ -1,0 +1,19 @@
+[Unit]
+Description=Discord Investment Management Bot
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/stock
+ExecStart=/home/ubuntu/stock/venv/bin/python /home/ubuntu/stock/bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+
+# Notes:
+# - This is an example service file. Copy it manually to /etc/systemd/system/discord-bot.service and customize as needed.
+# - `config.py` が `.env` を自動読み込みするため、原則として EnvironmentFile は不要です。
+# - どうしても systemd に `.env` を読み込ませる場合は、systemd 用のフォーマットに従って `EnvironmentFile=/home/ubuntu/stock/.env` を設定してください。

@@ -1,0 +1,17 @@
+# Environment variables
+.env
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.py[cod]
+*.pyo
+
+# Virtual environment
+venv/
+
+# SQLite database
+*.db
+*.sqlite
+*.sqlite3
+investment_data.db
