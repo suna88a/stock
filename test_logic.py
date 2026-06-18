@@ -45,6 +45,21 @@ def main():
         assert_equal(performance, 0, 'performance after deposit/withdraw')
         assert_close(return_rate, 0, 'return rate after deposit/withdraw')
 
+        db.set_asset(user_id, 6811322)
+        db.set_asset_breakdown(user_id, '国内株式', 994000, 'JPY')
+        db.set_asset_breakdown(user_id, '米国株式', 2995660, 'JPY')
+        db.set_asset_breakdown(user_id, '投資信託', 2404885, 'JPY')
+        db.set_asset_breakdown(user_id, '預り金', 381645, 'JPY')
+        db.set_asset_breakdown(user_id, 'USドル', 35132, 'JPY')
+        asset = db.get_asset(user_id)
+        breakdowns = {item['name']: item for item in db.get_asset_breakdowns(user_id)}
+        assert_equal(asset['total_asset'], 6811322, 'bulk asset line updates current asset')
+        assert_equal(breakdowns['国内株式']['amount'], 994000, 'asset breakdown domestic stocks')
+        assert_equal(breakdowns['米国株式']['amount'], 2995660, 'asset breakdown us stocks')
+        assert_equal(breakdowns['投資信託']['amount'], 2404885, 'asset breakdown fund')
+        assert_equal(breakdowns['預り金']['amount'], 381645, 'asset breakdown cash')
+        assert_equal(breakdowns['USドル']['amount'], 35132, 'asset breakdown usd')
+
         db.add_holding(user_id, 'NET', 77, 228.51, 'USD')
         db.add_holding(user_id, 'NET', 10, 220, 'USD')
         holding = db.get_holding_by_symbol(user_id, 'NET')

@@ -101,6 +101,19 @@ class InvestmentDatabase:
             )
         ''')
 
+        # 資産内訳テーブル
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS asset_breakdowns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                amount REAL NOT NULL,
+                currency TEXT DEFAULT 'JPY',
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, name)
+            )
+        ''')
+
         self._ensure_column(cursor, 'holdings', 'current_price', 'REAL')
         self._ensure_column(cursor, 'user_assets', 'initial_asset', 'INTEGER')
         self._ensure_column(cursor, 'user_assets', 'base_date', 'TEXT')
@@ -174,6 +187,53 @@ class InvestmentDatabase:
         ''', (initial_asset, initial_asset, base_date_text, user_id))
         conn.commit()
         conn.close()
+
+    def set_asset_breakdown(self, user_id, name, amount, currency='JPY'):
+        """資産内訳を登録・更新"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        name = str(name).strip()
+        currency = currency.upper()
+        cursor.execute('''
+            INSERT INTO asset_breakdowns (user_id, name, amount, currency)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id, name) DO UPDATE SET
+                amount = ?,
+                currency = ?,
+                updated_at = CURRENT_TIMESTAMP
+        ''', (user_id, name, amount, currency, amount, currency))
+        conn.commit()
+        conn.close()
+
+    def get_asset_breakdowns(self, user_id):
+        """資産内訳を取得"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT name, amount, currency, updated_at
+            FROM asset_breakdowns
+            WHERE user_id = ?
+            ORDER BY CASE name
+                WHEN '国内株式' THEN 1
+                WHEN '米国株式' THEN 2
+                WHEN '投資信託' THEN 3
+                WHEN '投信' THEN 3
+                WHEN '預り金' THEN 4
+                WHEN 'USドル' THEN 5
+                ELSE 99
+            END, name
+        ''', (user_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [
+            {
+                'name': row[0],
+                'amount': row[1],
+                'currency': row[2],
+                'updated_at': row[3],
+            }
+            for row in rows
+        ]
     
     def get_asset(self, user_id):
         """資産情報を取得"""
