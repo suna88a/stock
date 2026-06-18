@@ -5,6 +5,8 @@ import tempfile
 
 from config import BASE_ASSET, BASE_DATE
 from database import InvestmentDatabase
+from price_fetcher import normalize_ticker
+from time_utils import format_datetime_jst
 
 
 def assert_equal(actual, expected, label):
@@ -46,6 +48,16 @@ def main():
         assert_close(return_rate, 0, 'return rate after deposit/withdraw')
 
         db.set_asset(user_id, 6811322)
+        asset_change = db.get_asset_previous_change(user_id)
+        assert_equal(asset_change['current'], 6811322, 'asset history current')
+        assert_equal(asset_change['previous'], BASE_ASSET + 400000, 'asset history previous')
+        assert_equal(asset_change['change'], 6811322 - (BASE_ASSET + 400000), 'asset history change')
+        db.set_asset(user_id, 6800000)
+        db.set_asset(user_id, 6811322)
+        asset_change = db.get_asset_previous_change(user_id)
+        assert_equal(asset_change['current'], 6811322, 'asset history second current')
+        assert_equal(asset_change['previous'], 6800000, 'asset history second previous')
+        assert_equal(asset_change['change'], 11322, 'asset history second change')
         db.set_asset_breakdown(user_id, '国内株式', 994000, 'JPY')
         db.set_asset_breakdown(user_id, '米国株式', 2995660, 'JPY')
         db.set_asset_breakdown(user_id, '投資信託', 2404885, 'JPY')
@@ -71,6 +83,29 @@ def main():
         assert_equal(holding['quantity'], 20, 'buy adds quantity')
         assert_close(holding['purchase_price'], 230, 'buy recalculates average')
 
+        assert_equal(normalize_ticker('4633'), '4633.T', 'japanese ticker normalization')
+        assert_equal(normalize_ticker('AMZN'), 'AMZN', 'us ticker normalization')
+
+        before_price_update_asset = db.get_asset(user_id)['total_asset']
+        db.update_holding_valuation(user_id, 'NET', 250, 'USD', usdjpy=157.2, previous_close=240)
+        holding = db.get_holding_by_symbol(user_id, 'NET')
+        assert_close(holding['current_value'], 5000, 'usd holding value')
+        assert_close(holding['unrealized_pnl'], 400, 'usd holding pnl')
+        assert_close(holding['current_value_jpy'], 786000, 'usd holding value jpy')
+        assert_close(holding['unrealized_pnl_jpy'], 62880, 'usd holding pnl jpy')
+        assert_close(holding['day_change'], 10, 'usd day change')
+        assert_close(holding['day_change_rate'], 10 / 240, 'usd day change rate')
+        assert_equal(db.get_asset(user_id)['total_asset'], before_price_update_asset, 'price update does not change current asset')
+
+        db.add_holding(user_id, '4633', 100, 1800, 'JPY')
+        db.update_holding_valuation(user_id, '4633', 2438, 'JPY', usdjpy=157.2, previous_close=2500)
+        jpy_holding = db.get_holding_by_symbol(user_id, '4633')
+        assert_close(jpy_holding['current_value'], 243800, 'jpy holding value')
+        assert_close(jpy_holding['unrealized_pnl'], 63800, 'jpy holding pnl')
+        assert_close(jpy_holding['current_value_jpy'], 243800, 'jpy holding value jpy')
+        assert_close(jpy_holding['day_change'], -62, 'jpy day change')
+        assert_close(jpy_holding['day_change_rate'], -62 / 2500, 'jpy day change rate')
+
         sell_result = db.add_sell(user_id, 'NET', 5, 250, 'USD')
         holding = db.get_holding_by_symbol(user_id, 'NET')
         assert_equal(holding['quantity'], 15, 'sell subtracts quantity')
@@ -78,8 +113,16 @@ def main():
 
         before_asset = db.get_asset(user_id)['total_asset']
         db.add_simulation(user_id, 'SOFI', 300, 8.5, 'USD', 'AIテーマ監視')
+        db.update_simulation_valuation(user_id, 'SOFI', 10, 'USD', usdjpy=157.2, previous_close=9.5)
         after_asset = db.get_asset(user_id)['total_asset']
         assert_equal(after_asset, before_asset, 'simulation does not affect total asset')
+        simulation = db.get_simulations(user_id)[0]
+        assert_close(simulation['current_value'], 3000, 'simulation value')
+        assert_close(simulation['current_value_jpy'], 471600, 'simulation jpy value')
+        assert_close(simulation['day_change'], 0.5, 'simulation day change')
+        assert_close(simulation['day_change_rate'], 0.5 / 9.5, 'simulation day change rate')
+
+        assert_equal(format_datetime_jst('2026-06-18 15:22:19'), '2026-06-19 00:22:19', 'jst formatting')
 
         legacy_user_id = 67890
         conn = sqlite3.connect(db_path)

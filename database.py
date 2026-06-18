@@ -114,7 +114,20 @@ class InvestmentDatabase:
             )
         ''')
 
+        # 総資産履歴テーブル
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS asset_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                asset_value REAL NOT NULL,
+                currency TEXT DEFAULT 'JPY',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
         self._ensure_column(cursor, 'holdings', 'current_price', 'REAL')
+        self._ensure_position_columns(cursor, 'holdings')
+        self._ensure_position_columns(cursor, 'simulations')
         self._ensure_column(cursor, 'user_assets', 'initial_asset', 'INTEGER')
         self._ensure_column(cursor, 'user_assets', 'base_date', 'TEXT')
         
@@ -126,6 +139,22 @@ class InvestmentDatabase:
         columns = [row[1] for row in cursor.fetchall()]
         if column_name not in columns:
             cursor.execute(f'ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}')
+
+    def _ensure_position_columns(self, cursor, table_name):
+        columns = {
+            'current_currency': 'TEXT',
+            'current_value': 'REAL',
+            'current_value_jpy': 'REAL',
+            'unrealized_pnl': 'REAL',
+            'unrealized_pnl_jpy': 'REAL',
+            'unrealized_pnl_rate': 'REAL',
+            'previous_close': 'REAL',
+            'day_change': 'REAL',
+            'day_change_rate': 'REAL',
+            'price_updated_at': 'TEXT',
+        }
+        for column_name, column_type in columns.items():
+            self._ensure_column(cursor, table_name, column_name, column_type)
 
     def _ensure_user_asset(self, cursor, user_id):
         cursor.execute('''
@@ -162,14 +191,69 @@ class InvestmentDatabase:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         self._ensure_user_asset(cursor, user_id)
+        cursor.execute('SELECT total_asset FROM user_assets WHERE user_id = ?', (user_id,))
+        current = cursor.fetchone()
+        previous_asset = current[0] if current else None
+        cursor.execute('''
+            SELECT asset_value FROM asset_history
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+        ''', (user_id,))
+        latest_history = cursor.fetchone()
+        latest_history_value = latest_history[0] if latest_history else None
+        if previous_asset is not None and latest_history_value != previous_asset:
+            self._record_asset_history(cursor, user_id, previous_asset, 'JPY')
         cursor.execute('''
             UPDATE user_assets
             SET total_asset = ?, last_updated = CURRENT_TIMESTAMP
             WHERE user_id = ?
         ''', (total_asset, user_id))
+        self._record_asset_history(cursor, user_id, total_asset, 'JPY')
         
         conn.commit()
         conn.close()
+
+    def _record_asset_history(self, cursor, user_id, asset_value, currency='JPY'):
+        cursor.execute('''
+            INSERT INTO asset_history (user_id, asset_value, currency)
+            VALUES (?, ?, ?)
+        ''', (user_id, asset_value, currency.upper()))
+
+    def get_asset_previous_change(self, user_id):
+        """直近の総資産履歴から前回比を取得"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT asset_value, currency, created_at
+            FROM asset_history
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT 2
+        ''', (user_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        if not rows:
+            return {
+                'current': None,
+                'previous': None,
+                'change': None,
+                'change_rate': None,
+                'currency': 'JPY',
+                'updated_at': None,
+            }
+        current = rows[0][0]
+        previous = rows[1][0] if len(rows) >= 2 else None
+        change = current - previous if previous not in (None, 0) else None
+        change_rate = change / previous if change is not None and previous else None
+        return {
+            'current': current,
+            'previous': previous,
+            'change': change,
+            'change_rate': change_rate,
+            'currency': rows[0][1] or 'JPY',
+            'updated_at': rows[0][2],
+        }
 
     def set_base_asset(self, user_id, initial_asset, base_date):
         """基準資産・基準日・現在資産を設定"""
@@ -510,7 +594,12 @@ class InvestmentDatabase:
         cursor = conn.cursor()
         
         cursor.execute('''
-            SELECT symbol, quantity, purchase_price, currency, purchase_date, current_price
+            SELECT
+                symbol, quantity, purchase_price, currency, purchase_date, current_price,
+                current_currency, current_value, current_value_jpy,
+                unrealized_pnl, unrealized_pnl_jpy, unrealized_pnl_rate,
+                previous_close, day_change, day_change_rate,
+                price_updated_at
             FROM holdings WHERE user_id = ?
             ORDER BY symbol
         ''', (user_id,))
@@ -525,7 +614,17 @@ class InvestmentDatabase:
                 'purchase_price': row[2],
                 'currency': row[3],
                 'purchase_date': row[4],
-                'current_price': row[5]
+                'current_price': row[5],
+                'current_currency': row[6],
+                'current_value': row[7],
+                'current_value_jpy': row[8],
+                'unrealized_pnl': row[9],
+                'unrealized_pnl_jpy': row[10],
+                'unrealized_pnl_rate': row[11],
+                'previous_close': row[12],
+                'day_change': row[13],
+                'day_change_rate': row[14],
+                'price_updated_at': row[15],
             }
             for row in results
         ]
@@ -537,7 +636,12 @@ class InvestmentDatabase:
         symbol = symbol.upper()
         
         cursor.execute('''
-            SELECT symbol, quantity, purchase_price, currency, purchase_date, current_price
+            SELECT
+                symbol, quantity, purchase_price, currency, purchase_date, current_price,
+                current_currency, current_value, current_value_jpy,
+                unrealized_pnl, unrealized_pnl_jpy, unrealized_pnl_rate,
+                previous_close, day_change, day_change_rate,
+                price_updated_at
             FROM holdings WHERE user_id = ? AND symbol = ?
             ORDER BY purchase_date DESC
             LIMIT 1
@@ -553,9 +657,108 @@ class InvestmentDatabase:
                 'purchase_price': result[2],
                 'currency': result[3],
                 'purchase_date': result[4],
-                'current_price': result[5]
+                'current_price': result[5],
+                'current_currency': result[6],
+                'current_value': result[7],
+                'current_value_jpy': result[8],
+                'unrealized_pnl': result[9],
+                'unrealized_pnl_jpy': result[10],
+                'unrealized_pnl_rate': result[11],
+                'previous_close': result[12],
+                'day_change': result[13],
+                'day_change_rate': result[14],
+                'price_updated_at': result[15],
             }
         return None
+
+    def calculate_position_values(self, quantity, entry_price, current_price, currency='USD', usdjpy=None):
+        """評価額・損益・円換算を計算"""
+        currency = (currency or 'USD').upper()
+        quantity = quantity or 0
+        entry_price = entry_price or 0
+        current_price = current_price if current_price is not None else entry_price
+        current_value = quantity * current_price
+        cost = quantity * entry_price
+        unrealized_pnl = current_value - cost
+        unrealized_pnl_rate = (unrealized_pnl / cost * 100) if cost else 0
+
+        fx_rate = 1 if currency == 'JPY' else usdjpy
+        if fx_rate:
+            current_value_jpy = current_value * fx_rate
+            unrealized_pnl_jpy = unrealized_pnl * fx_rate
+        else:
+            current_value_jpy = None
+            unrealized_pnl_jpy = None
+
+        return {
+            'current_value': current_value,
+            'current_value_jpy': current_value_jpy,
+            'unrealized_pnl': unrealized_pnl,
+            'unrealized_pnl_jpy': unrealized_pnl_jpy,
+            'unrealized_pnl_rate': unrealized_pnl_rate,
+        }
+
+    def update_holding_valuation(
+        self,
+        user_id,
+        symbol,
+        current_price,
+        current_currency='USD',
+        usdjpy=None,
+        previous_close=None,
+        day_change=None,
+        day_change_rate=None,
+    ):
+        """保有銘柄の現在価格・評価額・損益を更新"""
+        holding = self.get_holding_by_symbol(user_id, symbol)
+        if not holding:
+            return False
+        current_currency = (current_currency or holding['currency'] or 'USD').upper()
+        if previous_close not in (None, 0) and day_change is None:
+            day_change = current_price - previous_close
+        if previous_close not in (None, 0) and day_change_rate is None and day_change is not None:
+            day_change_rate = day_change / previous_close
+        values = self.calculate_position_values(
+            holding['quantity'],
+            holding['purchase_price'],
+            current_price,
+            current_currency,
+            usdjpy,
+        )
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE holdings
+            SET current_price = ?,
+                current_currency = ?,
+                current_value = ?,
+                current_value_jpy = ?,
+                unrealized_pnl = ?,
+                unrealized_pnl_jpy = ?,
+                unrealized_pnl_rate = ?,
+                previous_close = ?,
+                day_change = ?,
+                day_change_rate = ?,
+                price_updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = ? AND symbol = ?
+        ''', (
+            current_price,
+            current_currency,
+            values['current_value'],
+            values['current_value_jpy'],
+            values['unrealized_pnl'],
+            values['unrealized_pnl_jpy'],
+            values['unrealized_pnl_rate'],
+            previous_close,
+            day_change,
+            day_change_rate,
+            user_id,
+            symbol.upper(),
+        ))
+        changed = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return changed > 0
 
     def update_holding_price(self, user_id, symbol, current_price):
         """保有銘柄の現在価格を更新"""
@@ -660,7 +863,12 @@ class InvestmentDatabase:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('''
-            SELECT ticker, quantity, entry_price, current_price, currency, memo, created_at, updated_at
+            SELECT
+                ticker, quantity, entry_price, current_price, currency, memo, created_at, updated_at,
+                current_currency, current_value, current_value_jpy,
+                unrealized_pnl, unrealized_pnl_jpy, unrealized_pnl_rate,
+                previous_close, day_change, day_change_rate,
+                price_updated_at
             FROM simulations
             WHERE user_id = ?
             ORDER BY ticker
@@ -677,9 +885,83 @@ class InvestmentDatabase:
                 'memo': row[5],
                 'created_at': row[6],
                 'updated_at': row[7],
+                'current_currency': row[8],
+                'current_value': row[9],
+                'current_value_jpy': row[10],
+                'unrealized_pnl': row[11],
+                'unrealized_pnl_jpy': row[12],
+                'unrealized_pnl_rate': row[13],
+                'previous_close': row[14],
+                'day_change': row[15],
+                'day_change_rate': row[16],
+                'price_updated_at': row[17],
             }
             for row in rows
         ]
+
+    def update_simulation_valuation(
+        self,
+        user_id,
+        ticker,
+        current_price,
+        current_currency='USD',
+        usdjpy=None,
+        previous_close=None,
+        day_change=None,
+        day_change_rate=None,
+    ):
+        """試算ポジションの現在価格・評価額・損益を更新"""
+        simulations = [item for item in self.get_simulations(user_id) if item['ticker'] == ticker.upper()]
+        if not simulations:
+            return False
+        simulation = simulations[0]
+        current_currency = (current_currency or simulation['currency'] or 'USD').upper()
+        if previous_close not in (None, 0) and day_change is None:
+            day_change = current_price - previous_close
+        if previous_close not in (None, 0) and day_change_rate is None and day_change is not None:
+            day_change_rate = day_change / previous_close
+        values = self.calculate_position_values(
+            simulation['quantity'],
+            simulation['entry_price'],
+            current_price,
+            current_currency,
+            usdjpy,
+        )
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE simulations
+            SET current_price = ?,
+                current_currency = ?,
+                current_value = ?,
+                current_value_jpy = ?,
+                unrealized_pnl = ?,
+                unrealized_pnl_jpy = ?,
+                unrealized_pnl_rate = ?,
+                previous_close = ?,
+                day_change = ?,
+                day_change_rate = ?,
+                price_updated_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE user_id = ? AND ticker = ?
+        ''', (
+            current_price,
+            current_currency,
+            values['current_value'],
+            values['current_value_jpy'],
+            values['unrealized_pnl'],
+            values['unrealized_pnl_jpy'],
+            values['unrealized_pnl_rate'],
+            previous_close,
+            day_change,
+            day_change_rate,
+            user_id,
+            ticker.upper(),
+        ))
+        changed = cursor.rowcount
+        conn.commit()
+        conn.close()
+        return changed > 0
 
     def update_simulation_price(self, user_id, ticker, current_price):
         """試算ポジションの現在価格を更新"""
