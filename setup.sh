@@ -18,7 +18,7 @@ echo "[INFO] Updating APT repositories..."
 sudo apt update
 
 echo "[INFO] Installing system packages..."
-sudo apt install -y python3 python3-pip python3-venv git tesseract-ocr libtesseract-dev tesseract-ocr-jpn tesseract-ocr-eng
+sudo apt install -y python3 python3-pip python3-venv git
 
 if [ ! -d "venv" ]; then
   echo "[INFO] Creating Python virtual environment..."

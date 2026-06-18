@@ -1,33 +1,23 @@
-"""投資管理Discord Bot - メイン"""
-import io
+"""投資取引台帳Discord Bot - メイン"""
 import os
 import re
+from datetime import datetime
 from pathlib import Path
+
 from dotenv import load_dotenv
 import discord
 from discord import app_commands
-from datetime import datetime, timedelta
-from PIL import Image
-
-# .envファイルから環境変数を読み込み
-env_path = Path(__file__).parent / '.env'
-load_dotenv(env_path, encoding='utf-8-sig')
-
-try:
-    import pytesseract
-except ImportError:
-    pytesseract = None
 
 from config import DISCORD_TOKEN, BASE_ASSET, ANNUAL_TARGET, BASE_DATE
 from database import InvestmentDatabase
 
-# Discord Botの初期化
+
+env_path = Path(__file__).parent / '.env'
+load_dotenv(env_path, encoding='utf-8-sig')
+
 intents = discord.Intents.default()
-intents.message_content = False  # Message Content Intent を無効化
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
-
-# データベース初期化
 db = InvestmentDatabase()
 
 
@@ -39,53 +29,181 @@ async def on_ready():
     print('コマンドを同期しました')
 
 
-def clean_number(value: str):
-    if not value:
-        return None
-    text = value.replace('¥', '').replace('$', '').replace(',', '').strip()
-    text = re.sub(r'[^\x00-\x7f]', ' ', text)
-    text = re.sub(r'\s+', ' ', text)
+def format_money(amount, currency='JPY'):
+    if amount is None:
+        amount = 0
+    if currency == 'JPY':
+        return f"¥{int(amount):,}"
+    return f"{amount:,.2f} {currency}"
+
+
+def clean_number(value):
+    return float(str(value).replace(',', ''))
+
+
+def default_currency_for_ticker(ticker, cash=False):
+    if cash:
+        return 'JPY'
+    if re.fullmatch(r'\d{4}', ticker):
+        return 'JPY'
+    return 'USD'
+
+
+def parse_date_text(value):
+    return datetime.strptime(value, '%Y-%m-%d')
+
+
+def asset_base_values(asset_info):
+    initial_asset = asset_info.get('initial_asset') or BASE_ASSET
+    base_date_text = asset_info.get('base_date') or BASE_DATE.date().isoformat()
     try:
-        return float(text)
+        base_date = parse_date_text(base_date_text)
     except ValueError:
-        return None
+        base_date = BASE_DATE
+    return initial_asset, base_date
 
 
-def extract_order_info(text: str):
-    text = text.replace('\r', '\n')
-    result = {}
+def split_line(line):
+    return re.sub(r'[\u3000\s]+', ' ', line.strip()).split(' ')
 
-    symbol_match = re.search(r'(?:銘柄|シンボル|Ticker)[:：\s]*([A-Za-z0-9]+)', text, re.IGNORECASE)
-    if symbol_match:
-        result['symbol'] = symbol_match.group(1).upper()
 
-    qty_match = re.search(r'(?:株数|数量|Qty|数量)[:：\s]*([\d,\.]+)', text, re.IGNORECASE)
-    if qty_match:
-        result['quantity'] = clean_number(qty_match.group(1))
+def parse_trade_like(parts, default_type, line_number, original):
+    if len(parts) < 3:
+        return None, f"{line_number}: {original}"
+    ticker = parts[0].upper()
+    try:
+        quantity = clean_number(parts[1])
+        price = clean_number(parts[2])
+    except ValueError:
+        return None, f"{line_number}: {original}"
+    currency = parts[3].upper() if len(parts) >= 4 and re.fullmatch(r'[A-Za-z]{3}', parts[3]) else default_currency_for_ticker(ticker)
+    memo_start = 4 if len(parts) >= 4 and re.fullmatch(r'[A-Za-z]{3}', parts[3]) else 3
+    return {
+        'type': default_type,
+        'ticker': ticker,
+        'quantity': quantity,
+        'price': price,
+        'currency': currency,
+        'memo': ' '.join(parts[memo_start:]),
+        'line': line_number,
+        'raw': original,
+    }, None
 
-    price_match = re.search(r'(?:取得単価|平均取得単価|価格|price)[:：\s]*([¥$]?[\d,\.]+)', text, re.IGNORECASE)
-    if price_match:
-        result['purchase_price'] = clean_number(price_match.group(1))
 
-    currency_match = re.search(r'(?:通貨)[:：\s]*([A-Z]{3})', text)
-    if currency_match:
-        result['currency'] = currency_match.group(1).upper()
+def parse_cash(parts, tx_type, line_number, original):
+    if len(parts) < 2:
+        return None, f"{line_number}: {original}"
+    try:
+        amount = clean_number(parts[1])
+    except ValueError:
+        return None, f"{line_number}: {original}"
+    currency = parts[2].upper() if len(parts) >= 3 and re.fullmatch(r'[A-Za-z]{3}', parts[2]) else 'JPY'
+    memo_start = 3 if len(parts) >= 3 and re.fullmatch(r'[A-Za-z]{3}', parts[2]) else 2
+    return {
+        'type': tx_type,
+        'amount': amount,
+        'currency': currency,
+        'memo': ' '.join(parts[memo_start:]),
+        'line': line_number,
+        'raw': original,
+    }, None
 
-    if 'currency' not in result:
-        if result.get('symbol', '').isalpha() and result['symbol'] != 'JPY':
-            result['currency'] = 'USD'
+
+def parse_bulk_text(text):
+    actions = {'DEPOSIT': [], 'WITHDRAW': [], 'BUY': [], 'SELL': [], 'HOLDING': [], 'SIM': []}
+    errors = []
+    section = None
+    section_map = {
+        '入出金': 'cash',
+        '保有': 'holding',
+        '試算': 'sim',
+    }
+    command_map = {
+        '入金': 'DEPOSIT',
+        'DEPOSIT': 'DEPOSIT',
+        '出金': 'WITHDRAW',
+        'WITHDRAW': 'WITHDRAW',
+        '買い': 'BUY',
+        'BUY': 'BUY',
+        '売り': 'SELL',
+        'SELL': 'SELL',
+        '保有': 'HOLDING',
+        'HOLDING': 'HOLDING',
+        '試算': 'SIM',
+        'SIM': 'SIM',
+    }
+
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        original = raw_line.strip()
+        if not original or original.startswith('#'):
+            continue
+        if original in section_map:
+            section = section_map[original]
+            continue
+
+        parts = split_line(original)
+        keyword = parts[0].upper()
+        japanese_keyword = parts[0]
+        tx_type = command_map.get(japanese_keyword) or command_map.get(keyword)
+
+        if tx_type in ('DEPOSIT', 'WITHDRAW'):
+            action, error = parse_cash(parts, tx_type, line_number, original)
+        elif tx_type in ('BUY', 'SELL', 'HOLDING', 'SIM'):
+            action, error = parse_trade_like(parts[1:], tx_type, line_number, original)
+        elif section == 'holding':
+            action, error = parse_trade_like(parts, 'HOLDING', line_number, original)
+        elif section == 'sim':
+            action, error = parse_trade_like(parts, 'SIM', line_number, original)
+        elif section == 'cash':
+            action, error = None, f"{line_number}: {original}"
         else:
-            result['currency'] = 'JPY'
+            action, error = None, f"{line_number}: {original}"
 
-    return result
+        if error:
+            errors.append(error)
+        elif action:
+            actions[action['type']].append(action)
+    return actions, errors
 
 
-class ConfirmOCRView(discord.ui.View):
-    def __init__(self, author_id: int, order_info: dict, raw_text: str):
+def summarize_action(action):
+    if action['type'] in ('DEPOSIT', 'WITHDRAW'):
+        return f"- {action['amount']:,.0f} {action['currency']} {action.get('memo', '')}".strip()
+    return (
+        f"- {action['ticker']} {action['quantity']:g}株 "
+        f"{action['price']:g} {action['currency']} {action.get('memo', '')}"
+    ).strip()
+
+
+def add_list_field(embed, name, items):
+    if not items:
+        return
+    text = '\n'.join(summarize_action(item) for item in items)
+    embed.add_field(name=name, value=text[:1000], inline=False)
+
+
+def build_bulk_confirm_embed(actions, errors):
+    embed = discord.Embed(title="一括反映の確認", color=discord.Color.blurple())
+    embed.description = "保有セクションは初期登録/修正として既存保有を上書きします。/買い は既存保有に加算します。"
+    add_list_field(embed, "入金", actions['DEPOSIT'])
+    add_list_field(embed, "出金", actions['WITHDRAW'])
+    add_list_field(embed, "買い", actions['BUY'])
+    add_list_field(embed, "売り", actions['SELL'])
+    add_list_field(embed, "保有", actions['HOLDING'])
+    add_list_field(embed, "試算", actions['SIM'])
+    if errors:
+        embed.add_field(name="エラー", value='\n'.join(f"- {err}" for err in errors)[:1000], inline=False)
+    success_count = sum(len(items) for items in actions.values())
+    embed.set_footer(text=f"成功候補: {success_count}件 / エラー: {len(errors)}件")
+    return embed
+
+
+class BulkApplyView(discord.ui.View):
+    def __init__(self, author_id, actions, errors):
         super().__init__(timeout=300)
         self.author_id = author_id
-        self.order_info = order_info
-        self.raw_text = raw_text
+        self.actions = actions
+        self.errors = errors
         self.completed = False
         self.message = None
 
@@ -96,232 +214,361 @@ class ConfirmOCRView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
-            await interaction.response.send_message(
-                'この確認は送信者のみ操作できます。',
-                ephemeral=True
-            )
+            await interaction.response.send_message('この確認は入力者のみ操作できます。', ephemeral=True)
             return False
         return True
 
     async def on_timeout(self):
-        if self.completed:
-            return
-
         self.completed = True
         self.disable_all_buttons()
-        if self.message is None:
-            return
-
-        embed = self.message.embeds[0] if self.message.embeds else discord.Embed()
-        embed.title = '⌛ OCR確認期限切れ'
-        embed.description = '確認期限が切れたため、このOCR結果は登録されませんでした。'
-        try:
-            await self.message.edit(embed=embed, view=self)
-        except discord.HTTPException:
-            pass
+        if self.message is not None:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
 
     @discord.ui.button(label='登録する', style=discord.ButtonStyle.green)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.completed:
-            await interaction.response.send_message(
-                'この確認はすでに処理済みです。',
-                ephemeral=True
-            )
+            await interaction.response.send_message('この確認はすでに処理済みです。', ephemeral=True)
             return
 
-        db.add_holding(
-            self.author_id,
-            self.order_info['symbol'],
-            self.order_info['quantity'],
-            self.order_info['purchase_price'],
-            self.order_info.get('currency') or 'JPY'
-        )
+        user_id = interaction.user.id
+        success = 0
+        failures = []
+        for action in self.actions['DEPOSIT']:
+            db.add_deposit(user_id, action['amount'], action['currency'], action['memo'])
+            success += 1
+        for action in self.actions['WITHDRAW']:
+            db.add_withdraw(user_id, action['amount'], action['currency'], action['memo'])
+            success += 1
+        for action in self.actions['BUY']:
+            db.add_buy(user_id, action['ticker'], action['quantity'], action['price'], action['currency'], action['memo'])
+            success += 1
+        for action in self.actions['SELL']:
+            try:
+                db.add_sell(user_id, action['ticker'], action['quantity'], action['price'], action['currency'], action['memo'])
+                success += 1
+            except ValueError as exc:
+                failures.append(f"{action['line']}: {exc}")
+        for action in self.actions['HOLDING']:
+            db.add_holding(user_id, action['ticker'], action['quantity'], action['price'], action['currency'], action['memo'])
+            success += 1
+        for action in self.actions['SIM']:
+            db.add_simulation(user_id, action['ticker'], action['quantity'], action['price'], action['currency'], action['memo'])
+            success += 1
+
         self.completed = True
         self.disable_all_buttons()
-        self.stop()
-
-        embed = discord.Embed(
-            title='✅ OCR結果を登録しました',
-            color=discord.Color.green()
-        )
-        embed.add_field(name='銘柄', value=self.order_info['symbol'], inline=False)
-        embed.add_field(name='株数', value=f"{self.order_info['quantity']:,}", inline=False)
-        embed.add_field(name='取得単価', value=f"{self.order_info['purchase_price']:,}", inline=False)
-        embed.add_field(name='通貨', value=self.order_info.get('currency', 'JPY'), inline=False)
-        embed.add_field(name='OCR抜粋', value=self.raw_text.strip()[:200] + ('...' if len(self.raw_text.strip()) > 200 else ''), inline=False)
+        embed = discord.Embed(title="一括反映を完了しました", color=discord.Color.green())
+        embed.add_field(name="成功件数", value=str(success), inline=False)
+        embed.add_field(name="失敗件数", value=str(len(self.errors) + len(failures)), inline=False)
+        if self.errors or failures:
+            embed.add_field(name="未反映", value='\n'.join(self.errors + failures)[:1000], inline=False)
         await interaction.response.edit_message(embed=embed, view=self)
 
     @discord.ui.button(label='キャンセル', style=discord.ButtonStyle.grey)
     async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.completed:
-            await interaction.response.send_message(
-                'この確認はすでに処理済みです。',
-                ephemeral=True
-            )
+            await interaction.response.send_message('この確認はすでに処理済みです。', ephemeral=True)
             return
-
         self.completed = True
         self.disable_all_buttons()
-        self.stop()
-
-        embed = discord.Embed(
-            title='❌ OCR結果の登録をキャンセルしました',
-            color=discord.Color.red()
-        )
-        embed.add_field(name='OCR抽出候補', value=self.raw_text.strip()[:200] + ('...' if len(self.raw_text.strip()) > 200 else ''), inline=False)
+        embed = discord.Embed(title="一括反映をキャンセルしました", color=discord.Color.red())
         await interaction.response.edit_message(embed=embed, view=self)
 
 
-async def process_screenshot_attachment(message: discord.Message, attachment: discord.Attachment):
-    if pytesseract is None:
-        await message.channel.send(
-            'OCR機能を使用するには、`pytesseract` と Tesseract OCR をインストールしてください。'
-        )
-        return
-
-    if not attachment.content_type or 'image' not in attachment.content_type:
-        return
-
-    data = await attachment.read()
-    image = Image.open(io.BytesIO(data))
-    text = pytesseract.image_to_string(image, lang='jpn+eng')
-    order_info = extract_order_info(text)
-
-    if not order_info.get('symbol') or order_info.get('quantity') is None or order_info.get('purchase_price') is None:
-        embed = discord.Embed(
-            title='OCR読み取りに失敗しました',
-            description='画像から必要な保有情報を抽出できませんでした。OCR結果を確認してください。',
-            color=discord.Color.red()
-        )
-        if order_info.get('symbol'):
-            embed.add_field(name='推定銘柄', value=order_info['symbol'], inline=False)
-        if order_info.get('quantity') is not None:
-            embed.add_field(name='推定株数', value=str(order_info['quantity']), inline=False)
-        if order_info.get('purchase_price') is not None:
-            embed.add_field(name='推定取得単価', value=str(order_info['purchase_price']), inline=False)
-        if order_info.get('currency'):
-            embed.add_field(name='推定通貨', value=order_info['currency'], inline=False)
-        embed.add_field(name='OCR生テキスト', value=text.strip()[:300] + ('...' if len(text.strip()) > 300 else ''), inline=False)
-        await message.channel.send(embed=embed)
-        return
-
-    embed = discord.Embed(
-        title='OCR読み取り結果を確認してください',
-        description='以下の内容で保有銘柄を登録します。誤りがなければ「登録する」を押してください。',
-        color=discord.Color.blue()
+class BulkApplyModal(discord.ui.Modal, title='一括反映'):
+    text = discord.ui.TextInput(
+        label='複数行テキスト',
+        style=discord.TextStyle.paragraph,
+        placeholder='入金 500000 JPY\n買い NET 10 220 USD',
+        required=True,
+        max_length=4000,
     )
-    embed.add_field(name='銘柄', value=order_info['symbol'], inline=False)
-    embed.add_field(name='株数', value=f"{order_info['quantity']:,}", inline=False)
-    embed.add_field(name='取得単価', value=f"{order_info['purchase_price']:,}", inline=False)
-    embed.add_field(name='通貨', value=order_info.get('currency', 'JPY'), inline=False)
-    embed.add_field(name='OCR生テキスト', value=text.strip()[:300] + ('...' if len(text.strip()) > 300 else ''), inline=False)
 
-    view = ConfirmOCRView(message.author.id, order_info, text)
-    sent_message = await message.channel.send(embed=embed, view=view)
-    view.message = sent_message
+    async def on_submit(self, interaction: discord.Interaction):
+        actions, errors = parse_bulk_text(str(self.text.value))
+        view = BulkApplyView(interaction.user.id, actions, errors)
+        await interaction.response.send_message(embed=build_bulk_confirm_embed(actions, errors), view=view)
+        view.message = await interaction.original_response()
 
 
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot:
-        return
-    if message.attachments:
-        for attachment in message.attachments:
-            if attachment.content_type and 'image' in attachment.content_type:
-                await process_screenshot_attachment(message, attachment)
-                return
-    await bot.process_app_commands(message)
+def create_asset_embed(user_id, total_asset):
+    cash_flow = db.get_cash_flow_summary(user_id)
+    net_deposit = cash_flow['net_deposit']
+    asset_info = db.get_asset(user_id)
+    initial_asset, base_date = asset_base_values(asset_info)
+
+    increase = total_asset - initial_asset
+    operation_result = increase - net_deposit
+    target_amount = initial_asset * (1 + ANNUAL_TARGET)
+    target_increase = target_amount - initial_asset
+    progress = (increase / target_increase) * 100 if target_increase > 0 else 0
+
+    embed = discord.Embed(title="📊 資産情報", color=discord.Color.blue())
+    embed.add_field(name="現在の資産", value=format_money(total_asset), inline=False)
+    embed.add_field(name="基準資産", value=format_money(initial_asset), inline=False)
+    embed.add_field(name="入金合計", value=format_money(cash_flow['deposit_total']), inline=False)
+    embed.add_field(name="出金合計", value=format_money(cash_flow['withdraw_total']), inline=False)
+    embed.add_field(name="純入金額", value=format_money(net_deposit), inline=False)
+    embed.add_field(name="運用成果", value=format_money(operation_result), inline=False)
+    embed.add_field(name="年率20%目標額", value=format_money(target_amount), inline=False)
+    embed.add_field(name="目標進捗", value=f"{progress:.1f}%", inline=False)
+    embed.set_footer(text=f"基準日: {base_date.strftime('%Y年%m月%d日')}")
+    return embed
 
 
-@tree.command(
-    name="資産",
-    description="現在の総資産を記録・確認します"
-)
-async def set_asset(
-    interaction: discord.Interaction,
-    金額: int
-):
+@tree.command(name="資産", description="現在の総資産を記録・確認します")
+async def set_asset(interaction: discord.Interaction, 金額: int):
     """資産コマンド: /資産 金額"""
     user_id = interaction.user.id
-    
-    # データベースに保存
     db.set_asset(user_id, 金額)
-    total_deposits = db.get_deposits(user_id)
-    
-    # 基準資産からの増減を計算
-    increase = 金額 - BASE_ASSET
-    increase_rate = (increase / BASE_ASSET) * 100
-    return_excluding_deposits = increase - total_deposits
-    return_excluding_deposits_rate = (return_excluding_deposits / BASE_ASSET) * 100
-    
-    # 年率目標に対する進捗を計算
-    target_amount = BASE_ASSET * (1 + ANNUAL_TARGET)
-    target_increase = target_amount - BASE_ASSET
-    progress = (increase / target_increase) * 100 if target_increase > 0 else 0
-    
-    embed = discord.Embed(
-        title="📊 資産情報",
-        color=discord.Color.blue()
-    )
-    embed.add_field(name="現在の資産", value=f"¥{金額:,}", inline=False)
-    embed.add_field(name="基準資産", value=f"¥{BASE_ASSET:,}", inline=False)
-    embed.add_field(name="入金累計", value=f"¥{total_deposits:,}", inline=False)
-    embed.add_field(name="総リターン", value=f"¥{increase:,} ({increase_rate:+.2f}%)", inline=False)
-    embed.add_field(name="入金除外リターン", value=f"¥{return_excluding_deposits:,} ({return_excluding_deposits_rate:+.2f}%)", inline=False)
-    embed.add_field(name="年率20%目標額", value=f"¥{target_amount:,}", inline=False)
-    embed.add_field(name="目標進捗", value=f"{progress:.1f}%", inline=False)
-    embed.set_footer(text=f"基準日: {BASE_DATE.strftime('%Y年%m月%d日')}")
-    
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=create_asset_embed(user_id, 金額))
 
 
-@tree.command(
-    name="入金",
-    description="入金を記録します"
-)
-async def add_deposit(
-    interaction: discord.Interaction,
-    金額: int
-):
-    """入金コマンド: /入金 金額"""
+@tree.command(name="資産設定", description="基準資産・基準日・現在資産を設定します")
+async def set_base_asset(interaction: discord.Interaction, 金額: int, 基準日: str = '2026-06-09'):
+    """資産設定コマンド: /資産設定 金額 YYYY-MM-DD"""
     user_id = interaction.user.id
-    
-    # データベースに記録
-    db.add_deposit(user_id, 金額)
-    
-    # 累計入金を取得
-    total_deposits = db.get_deposits(user_id)
-    
-    embed = discord.Embed(
-        title="💰 入金を記録しました",
-        color=discord.Color.green()
-    )
-    embed.add_field(name="入金額", value=f"¥{金額:,}", inline=False)
-    embed.add_field(name="累計入金", value=f"¥{total_deposits:,}", inline=False)
-    embed.set_footer(text=f"記録日時: {datetime.now().strftime('%Y年%m月%d日 %H:%M')}")
-    
+    try:
+        base_date = parse_date_text(基準日)
+    except ValueError:
+        await interaction.response.send_message("基準日は `YYYY-MM-DD` 形式で入力してください。例: `/資産設定 7096249 2026-06-09`")
+        return
+
+    db.set_base_asset(user_id, 金額, base_date.date())
+    embed = discord.Embed(title="基準資産を設定しました", color=discord.Color.blue())
+    embed.add_field(name="基準資産", value=format_money(金額), inline=False)
+    embed.add_field(name="現在資産", value=format_money(金額), inline=False)
+    embed.add_field(name="基準日", value=base_date.strftime('%Y-%m-%d'), inline=False)
     await interaction.response.send_message(embed=embed)
 
 
-@tree.command(
-    name="保有",
-    description="保有銘柄を登録します"
-)
+@tree.command(name="更新", description="総資産または現在価格を更新します")
+async def update_asset(
+    interaction: discord.Interaction,
+    金額: int = 0,
+    銘柄: str = '',
+    現在価格: float = 0.0
+):
+    """更新コマンド: /更新 金額 または /更新 銘柄 現在価格"""
+    user_id = interaction.user.id
+    if 銘柄 and 現在価格 > 0:
+        ticker = 銘柄.upper()
+        holding_changed = db.update_holding_price(user_id, ticker, 現在価格)
+        sim_changed = db.update_simulation_price(user_id, ticker, 現在価格)
+        embed = discord.Embed(title="価格を更新しました", color=discord.Color.blue())
+        embed.add_field(name="銘柄", value=ticker, inline=False)
+        embed.add_field(name="現在価格", value=f"{現在価格:,}", inline=False)
+        embed.add_field(name="保有更新", value=f"{holding_changed}件", inline=False)
+        embed.add_field(name="試算更新", value=f"{sim_changed}件", inline=False)
+        await interaction.response.send_message(embed=embed)
+        return
+
+    if 金額 <= 0:
+        result = db.refresh_current_prices_fallback(user_id)
+        holdings_value = db.get_holdings_market_value(user_id)
+        simulations_value = db.get_simulations_market_value(user_id)
+        embed = discord.Embed(title="現在価格を更新しました", color=discord.Color.blue())
+        embed.description = "現在価格取得は仮実装です。未設定の現在価格には取得単価を使用しました。"
+        embed.add_field(name="保有更新", value=f"{result['holdings_changed']}件", inline=False)
+        embed.add_field(name="試算更新", value=f"{result['simulations_changed']}件", inline=False)
+        embed.add_field(name="保有評価額", value=f"{holdings_value:,.2f}", inline=False)
+        embed.add_field(name="試算評価額", value=f"{simulations_value:,.2f}（レビュー総資産には含めません）", inline=False)
+        await interaction.response.send_message(embed=embed)
+        return
+
+    db.set_asset(user_id, 金額)
+    await interaction.response.send_message(embed=create_asset_embed(user_id, 金額))
+
+
+@tree.command(name="入金", description="入金を記録します")
+async def add_deposit(interaction: discord.Interaction, 金額: int, 通貨: str = 'JPY', メモ: str = ''):
+    """入金コマンド: /入金 金額 通貨"""
+    user_id = interaction.user.id
+    currency = 通貨.upper()
+    db.add_deposit(user_id, 金額, currency, メモ)
+    cash_flow = db.get_cash_flow_summary(user_id)
+
+    embed = discord.Embed(title="💰 入金を記録しました", color=discord.Color.green())
+    embed.add_field(name="入金額", value=format_money(金額, currency), inline=False)
+    embed.add_field(name="入金合計", value=format_money(cash_flow['deposit_total']), inline=False)
+    embed.add_field(name="純入金額", value=format_money(cash_flow['net_deposit']), inline=False)
+    embed.set_footer(text=f"記録日時: {datetime.now().strftime('%Y年%m月%d日 %H:%M')}")
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="出金", description="出金を記録します")
+async def add_withdraw(interaction: discord.Interaction, 金額: int, 通貨: str = 'JPY', メモ: str = ''):
+    """出金コマンド: /出金 金額 通貨"""
+    user_id = interaction.user.id
+    currency = 通貨.upper()
+    db.add_withdraw(user_id, 金額, currency, メモ)
+    cash_flow = db.get_cash_flow_summary(user_id)
+
+    embed = discord.Embed(title="💸 出金を記録しました", color=discord.Color.orange())
+    embed.add_field(name="出金額", value=format_money(金額, currency), inline=False)
+    embed.add_field(name="出金合計", value=format_money(cash_flow['withdraw_total']), inline=False)
+    embed.add_field(name="純入金額", value=format_money(cash_flow['net_deposit']), inline=False)
+    embed.set_footer(text=f"記録日時: {datetime.now().strftime('%Y年%m月%d日 %H:%M')}")
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="買い", description="買い取引を記録します")
+async def add_buy(interaction: discord.Interaction, 銘柄: str, 株数: float, 価格: float, 通貨: str = 'USD', メモ: str = ''):
+    """買いコマンド: /買い 銘柄 株数 価格 通貨"""
+    user_id = interaction.user.id
+    currency = 通貨.upper()
+    holding = db.add_buy(user_id, 銘柄, 株数, 価格, currency, メモ)
+
+    embed = discord.Embed(title="🟢 買い取引を記録しました", color=discord.Color.green())
+    embed.add_field(name="銘柄", value=holding['symbol'], inline=False)
+    embed.add_field(name="買付株数", value=f"{株数:,}", inline=False)
+    embed.add_field(name="買付価格", value=format_money(価格, currency), inline=False)
+    embed.add_field(name="買付金額", value=format_money(株数 * 価格, currency), inline=False)
+    embed.add_field(name="現在株数", value=f"{holding['quantity']:,}", inline=False)
+    embed.add_field(name="平均取得単価", value=format_money(holding['purchase_price'], currency), inline=False)
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="売り", description="売り取引を記録します")
+async def add_sell(interaction: discord.Interaction, 銘柄: str, 株数: float, 価格: float, 通貨: str = 'USD', メモ: str = ''):
+    """売りコマンド: /売り 銘柄 株数 価格 通貨"""
+    user_id = interaction.user.id
+    currency = 通貨.upper()
+    try:
+        result = db.add_sell(user_id, 銘柄, 株数, 価格, currency, メモ)
+    except ValueError as exc:
+        await interaction.response.send_message(f"❌ {exc}")
+        return
+
+    embed = discord.Embed(title="🔴 売り取引を記録しました", color=discord.Color.red())
+    embed.add_field(name="銘柄", value=result['symbol'], inline=False)
+    embed.add_field(name="売却株数", value=f"{株数:,}", inline=False)
+    embed.add_field(name="売却価格", value=format_money(価格, currency), inline=False)
+    embed.add_field(name="売却金額", value=format_money(株数 * 価格, currency), inline=False)
+    embed.add_field(name="残り株数", value=f"{result['quantity']:,}", inline=False)
+    embed.add_field(name="実現損益", value=format_money(result['realized_profit'], currency), inline=False)
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="履歴", description="直近の取引履歴を表示します")
+async def show_transactions(interaction: discord.Interaction, 件数: int = 10):
+    """履歴コマンド: /履歴"""
+    user_id = interaction.user.id
+    limit = max(1, min(件数, 20))
+    transactions = db.get_transactions(user_id, limit)
+    if not transactions:
+        await interaction.response.send_message("取引履歴がありません。")
+        return
+
+    embed = discord.Embed(title=f"🧾 直近{limit}件の取引履歴", color=discord.Color.blurple())
+    for tx in transactions:
+        value = (
+            f"type: {tx['type']}\n"
+            f"ticker: {tx['ticker'] or '-'}\n"
+            f"quantity: {tx['quantity'] if tx['quantity'] is not None else '-'}\n"
+            f"price: {tx['price'] if tx['price'] is not None else '-'}\n"
+            f"amount: {tx['amount'] if tx['amount'] is not None else '-'} {tx['currency'] or ''}\n"
+            f"memo: {tx['memo'] or '-'}"
+        )
+        embed.add_field(name=tx['date'], value=value, inline=False)
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="一括反映", description="複数行テキストを解析して確認後に一括登録します")
+async def bulk_apply(interaction: discord.Interaction):
+    await interaction.response.send_modal(BulkApplyModal())
+
+
+@tree.command(name="試算", description="試算ポジションを表示します")
+async def show_simulations(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    simulations = db.get_simulations(user_id)
+    if not simulations:
+        await interaction.response.send_message("試算ポジションはありません。")
+        return
+
+    embed = discord.Embed(title="🧪 試算ポジション", color=discord.Color.teal())
+    for sim in simulations:
+        current_price = sim['current_price'] if sim['current_price'] is not None else sim['entry_price']
+        market_value = sim['quantity'] * current_price
+        profit = (current_price - sim['entry_price']) * sim['quantity']
+        profit_rate = ((current_price - sim['entry_price']) / sim['entry_price'] * 100) if sim['entry_price'] else 0
+        embed.add_field(
+            name=sim['ticker'],
+            value=(
+                f"想定株数: {sim['quantity']:,}\n"
+                f"想定取得単価: {sim['entry_price']:,} {sim['currency']}\n"
+                f"現在価格: {current_price:,} {sim['currency']}\n"
+                f"想定評価額: {market_value:,.2f} {sim['currency']}\n"
+                f"想定損益: {profit:,.2f} {sim['currency']} ({profit_rate:+.2f}%)\n"
+                f"memo: {sim['memo'] or '-'}"
+            ),
+            inline=False
+        )
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="試算登録", description="試算ポジションを登録します")
+async def add_simulation(interaction: discord.Interaction, 銘柄: str, 株数: float, 価格: float, 通貨: str = 'USD', メモ: str = ''):
+    user_id = interaction.user.id
+    db.add_simulation(user_id, 銘柄, 株数, 価格, 通貨, メモ)
+    embed = discord.Embed(title="試算ポジションを登録しました", color=discord.Color.teal())
+    embed.add_field(name="銘柄", value=銘柄.upper(), inline=False)
+    embed.add_field(name="想定株数", value=f"{株数:,}", inline=False)
+    embed.add_field(name="想定取得単価", value=f"{価格:,} {通貨.upper()}", inline=False)
+    embed.add_field(name="memo", value=メモ or '-', inline=False)
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="試算削除", description="試算ポジションを削除します")
+async def delete_simulation(interaction: discord.Interaction, 銘柄: str):
+    user_id = interaction.user.id
+    changed = db.delete_simulation(user_id, 銘柄)
+    if changed:
+        await interaction.response.send_message(f"{銘柄.upper()} の試算を削除しました。")
+    else:
+        await interaction.response.send_message(f"{銘柄.upper()} の試算は見つかりませんでした。")
+
+
+@tree.command(name="保有", description="保有一覧の表示、または保有銘柄を初期登録・修正します")
 async def add_holding(
     interaction: discord.Interaction,
-    銘柄: str,
-    株数: float,
-    取得単価: float,
+    銘柄: str = '',
+    株数: float = 0.0,
+    取得単価: float = 0.0,
     通貨: str = 'JPY'
 ):
     """保有コマンド: /保有 銘柄 株数 取得単価 通貨"""
     user_id = interaction.user.id
+    if not 銘柄:
+        holdings = db.get_holdings(user_id)
+        if not holdings:
+            await interaction.response.send_message("保有銘柄はありません。")
+            return
+        embed = discord.Embed(title="📈 保有銘柄一覧", color=discord.Color.brand_green())
+        for holding in holdings:
+            current_price = holding.get('current_price')
+            value = (
+                f"株数: {holding['quantity']:,}\n"
+                f"平均取得単価: {holding['purchase_price']:,} {holding['currency']}"
+            )
+            if current_price is not None:
+                value += f"\n現在価格: {current_price:,} {holding['currency']}"
+            embed.add_field(name=holding['symbol'], value=value, inline=False)
+        await interaction.response.send_message(embed=embed)
+        return
+
+    if 株数 <= 0 or 取得単価 <= 0:
+        await interaction.response.send_message("登録する場合は `/保有 銘柄 株数 取得単価 通貨` を入力してください。")
+        return
+
     db.add_holding(user_id, 銘柄, 株数, 取得単価, 通貨)
 
-    embed = discord.Embed(
-        title="📈 保有銘柄を登録しました",
-        color=discord.Color.brand_green()
-    )
+    embed = discord.Embed(title="📈 保有銘柄を登録しました", color=discord.Color.brand_green())
+    embed.description = "通常運用では `/買い` `/売り` を使い、初期登録や修正時だけ `/保有` を使います。"
     embed.add_field(name="銘柄", value=銘柄.upper(), inline=False)
     embed.add_field(name="株数", value=f"{株数:,}", inline=False)
     embed.add_field(name="取得単価", value=f"{取得単価:,} {通貨.upper()}", inline=False)
@@ -329,26 +576,12 @@ async def add_holding(
     await interaction.response.send_message(embed=embed)
 
 
-@tree.command(
-    name="仮説登録",
-    description="銘柄の投資仮説を登録・更新します"
-)
-async def register_hypothesis(
-    interaction: discord.Interaction,
-    銘柄: str,
-    保有理由: str,
-    期待数字: str,
-    買い増し条件: str,
-    損切り条件: str
-):
-    """仮説登録コマンド: /仮説登録 銘柄 保有理由 期待数字 買い増し条件 損切り条件"""
+@tree.command(name="仮説登録", description="銘柄の投資仮説を登録・更新します")
+async def register_hypothesis(interaction: discord.Interaction, 銘柄: str, 保有理由: str, 期待数字: str, 買い増し条件: str, 損切り条件: str):
     user_id = interaction.user.id
     db.add_or_update_hypothesis(user_id, 銘柄, 保有理由, 期待数字, 買い増し条件, 損切り条件)
 
-    embed = discord.Embed(
-        title="🧠 投資仮説を登録しました",
-        color=discord.Color.blurple()
-    )
+    embed = discord.Embed(title="🧠 投資仮説を登録しました", color=discord.Color.blurple())
     embed.add_field(name="銘柄", value=銘柄.upper(), inline=False)
     embed.add_field(name="保有理由", value=保有理由, inline=False)
     embed.add_field(name="期待数字", value=期待数字, inline=False)
@@ -357,28 +590,17 @@ async def register_hypothesis(
     await interaction.response.send_message(embed=embed)
 
 
-@tree.command(
-    name="仮説",
-    description="登録済みの銘柄仮説を確認します"
-)
-async def show_hypothesis(
-    interaction: discord.Interaction,
-    銘柄: str
-):
-    """仮説コマンド: /仮説 銘柄"""
+@tree.command(name="仮説", description="登録済みの銘柄仮説を確認します")
+async def show_hypothesis(interaction: discord.Interaction, 銘柄: str):
     user_id = interaction.user.id
     hypothesis = db.get_hypothesis(user_id, 銘柄)
-
     if not hypothesis:
         await interaction.response.send_message(
             f"❌ {銘柄.upper()} の投資仮説が登録されていません。`/仮説登録` で登録してください。"
         )
         return
 
-    embed = discord.Embed(
-        title=f"🧠 {hypothesis['symbol']} の投資仮説",
-        color=discord.Color.blurple()
-    )
+    embed = discord.Embed(title=f"🧠 {hypothesis['symbol']} の投資仮説", color=discord.Color.blurple())
     embed.add_field(name="保有理由", value=hypothesis['reason'], inline=False)
     embed.add_field(name="期待数字", value=hypothesis['expected_return'], inline=False)
     embed.add_field(name="買い増し条件", value=hypothesis['add_condition'], inline=False)
@@ -387,43 +609,29 @@ async def show_hypothesis(
     await interaction.response.send_message(embed=embed)
 
 
-@tree.command(
-    name="判定",
-    description="銘柄判定の情報を表示します"
-)
-async def evaluate_holding(
-    interaction: discord.Interaction,
-    銘柄: str
-):
-    """判定コマンド: /判定 銘柄"""
+@tree.command(name="判定", description="銘柄判定の情報を表示します")
+async def evaluate_holding(interaction: discord.Interaction, 銘柄: str):
     user_id = interaction.user.id
     asset_info = db.get_asset(user_id)
     current_asset = asset_info['total_asset'] if asset_info else 0
     holding = db.get_holding_by_symbol(user_id, 銘柄)
     hypothesis = db.get_hypothesis(user_id, 銘柄)
-
     if not holding:
         await interaction.response.send_message(
-            f"❌ {銘柄.upper()} の保有情報が登録されていません。`/保有` で登録してください。"
+            f"❌ {銘柄.upper()} の保有情報が登録されていません。`/買い` または `/保有` で登録してください。"
         )
         return
 
     total_cost = holding['quantity'] * holding['purchase_price']
     ratio = (total_cost / current_asset * 100) if current_asset else 0
-    status = "✅ 問題なし"
-    if ratio >= 40:
-        status = "⚠️ 40% を超えています。分散を検討しましょう。"
+    status = "✅ 問題なし" if ratio < 40 else "⚠️ 40% を超えています。分散を検討しましょう。"
 
-    embed = discord.Embed(
-        title=f"🧾 {holding['symbol']} の判定",
-        color=discord.Color.gold()
-    )
+    embed = discord.Embed(title=f"🧾 {holding['symbol']} の判定", color=discord.Color.gold())
     embed.add_field(name="保有数量", value=f"{holding['quantity']:,}", inline=False)
-    embed.add_field(name="取得単価", value=f"{holding['purchase_price']:,} {holding['currency']}", inline=False)
-    embed.add_field(name="保有コスト", value=f"¥{int(total_cost):,}", inline=False)
+    embed.add_field(name="平均取得単価", value=f"{holding['purchase_price']:,} {holding['currency']}", inline=False)
+    embed.add_field(name="保有コスト", value=format_money(total_cost, holding['currency']), inline=False)
     embed.add_field(name="資産比率", value=f"{ratio:.2f}%", inline=False)
     embed.add_field(name="判定", value=status, inline=False)
-
     if hypothesis:
         embed.add_field(name="保有理由", value=hypothesis['reason'], inline=False)
         embed.add_field(name="期待数字", value=hypothesis['expected_return'], inline=False)
@@ -431,31 +639,22 @@ async def evaluate_holding(
         embed.add_field(name="損切り条件", value=hypothesis['cut_condition'], inline=False)
     else:
         embed.add_field(name="仮説", value="登録されていません。`/仮説登録` で追加してください。", inline=False)
-
     await interaction.response.send_message(embed=embed)
 
 
-@tree.command(
-    name="比率",
-    description="保有銘柄の資産比率を表示します"
-)
+@tree.command(name="比率", description="保有銘柄の資産比率を表示します")
 async def show_ratios(interaction: discord.Interaction):
-    """比率コマンド: /比率"""
     user_id = interaction.user.id
     asset_info = db.get_asset(user_id)
     current_asset = asset_info['total_asset'] if asset_info else 0
     holdings = db.get_holdings(user_id)
-
     if not holdings or current_asset == 0:
         await interaction.response.send_message(
-            "❌ 保有銘柄または資産情報が登録されていません。`/保有` と `/資産` を使ってください。"
+            "❌ 保有銘柄または資産情報が登録されていません。`/買い` または `/保有` と `/資産` を使ってください。"
         )
         return
 
-    embed = discord.Embed(
-        title="📊 保有銘柄の比率",
-        color=discord.Color.blue()
-    )
+    embed = discord.Embed(title="📊 保有銘柄の比率", color=discord.Color.blue())
     warnings = []
     for holding in holdings:
         cost = holding['quantity'] * holding['purchase_price']
@@ -464,115 +663,99 @@ async def show_ratios(interaction: discord.Interaction):
             name=f"{holding['symbol']} ({holding['currency']})",
             value=(
                 f"{holding['quantity']:,} 株 @ {holding['purchase_price']:,}\n"
-                f"コスト: ¥{int(cost):,}\n"
+                f"コスト: {format_money(cost, holding['currency'])}\n"
                 f"比率: {ratio:.2f}%"
             ),
             inline=False
         )
         if ratio >= 40:
             warnings.append(f"{holding['symbol']} が {ratio:.2f}% で40%超です。")
-
     if warnings:
         embed.add_field(name="⚠️ 警告", value="\n".join(warnings), inline=False)
     await interaction.response.send_message(embed=embed)
 
 
-@tree.command(
-    name="レビュー",
-    description="3か月ごとのレビューを表示します"
-)
-async def show_review(interaction: discord.Interaction):
-    """レビューコマンド: /レビュー"""
+@tree.command(name="目標", description="年率20%達成に必要な資産額を表示します")
+async def show_goal(interaction: discord.Interaction):
     user_id = interaction.user.id
-    
-    # 現在の資産を取得
     asset_info = db.get_asset(user_id)
-    
+    current_asset = asset_info['total_asset'] if asset_info else 0
+    initial_asset, _ = asset_base_values(asset_info)
+    target_amount = initial_asset * (1 + ANNUAL_TARGET)
+    difference = current_asset - target_amount if current_asset else -target_amount
+
+    embed = discord.Embed(title="🎯 年率20%目標", color=discord.Color.green())
+    embed.add_field(name="基準資産", value=format_money(initial_asset), inline=False)
+    embed.add_field(name="目標額", value=format_money(target_amount), inline=False)
+    embed.add_field(name="現在資産", value=format_money(current_asset), inline=False)
+    embed.add_field(name="目標との差分", value=format_money(difference), inline=False)
+    await interaction.response.send_message(embed=embed)
+
+
+@tree.command(name="レビュー", description="取引台帳ベースのレビューを表示します")
+async def show_review(interaction: discord.Interaction):
+    user_id = interaction.user.id
+    asset_info = db.get_asset(user_id)
     if not asset_info:
         await interaction.response.send_message(
             "❌ 資産情報が登録されていません。\n`/資産 金額` で資産を登録してください。"
         )
         return
-    
+
     current_asset = asset_info['total_asset']
-    total_deposits = db.get_deposits(user_id)
-    
-    # 基準日から経過日数を計算
+    initial_asset, base_date = asset_base_values(asset_info)
+    cash_flow = db.get_cash_flow_summary(user_id)
+    net_deposit = cash_flow['net_deposit']
+    operation_result = current_asset - initial_asset - net_deposit
+    return_excluding_deposits_rate = (operation_result / initial_asset) * 100 if initial_asset else 0
+    target_amount = initial_asset * (1 + ANNUAL_TARGET)
+    target_diff = current_asset - target_amount
     today = datetime.now().date()
-    base_date = BASE_DATE.date()
-    days_elapsed = (today - base_date).days
-    
-    # 3か月単位のレビュー
+    days_elapsed = (today - base_date.date()).days
     quarters_passed = days_elapsed // 90
-    
-    # リターン計算
-    total_return = current_asset - BASE_ASSET
-    return_excluding_deposits = current_asset - BASE_ASSET - total_deposits
-    
-    # 入金を除外したリターン率
-    if return_excluding_deposits != 0:
-        return_excluding_deposits_rate = (return_excluding_deposits / BASE_ASSET) * 100
-    else:
-        return_excluding_deposits_rate = 0
-    
-    embed = discord.Embed(
-        title="📋 投資レビュー",
-        color=discord.Color.purple()
-    )
+
+    embed = discord.Embed(title="📋 投資レビュー", color=discord.Color.purple())
     embed.add_field(name="レビュー期間", value=f"基準日から {quarters_passed}四半期 ({days_elapsed}日)", inline=False)
-    embed.add_field(name="基準資産", value=f"¥{BASE_ASSET:,}", inline=False)
-    embed.add_field(name="現在の資産", value=f"¥{current_asset:,}", inline=False)
-    embed.add_field(name="入金総額", value=f"¥{total_deposits:,}", inline=False)
-    embed.add_field(name="総リターン", value=f"¥{total_return:,}", inline=False)
-    embed.add_field(
-        name="入金除外リターン",
-        value=f"¥{return_excluding_deposits:,} ({return_excluding_deposits_rate:+.2f}%)",
-        inline=False
-    )
-    
-    # 推移
-    if quarters_passed > 0:
-        avg_quarterly_return = total_return / quarters_passed
-        embed.add_field(
-            name="平均四半期リターン",
-            value=f"¥{int(avg_quarterly_return):,}",
-            inline=False
-        )
-    
+    embed.add_field(name="基準資産", value=format_money(initial_asset), inline=False)
+    embed.add_field(name="現在資産", value=format_money(current_asset), inline=False)
+    embed.add_field(name="入金合計", value=format_money(cash_flow['deposit_total']), inline=False)
+    embed.add_field(name="出金合計", value=format_money(cash_flow['withdraw_total']), inline=False)
+    embed.add_field(name="純入金額", value=format_money(net_deposit), inline=False)
+    embed.add_field(name="運用成果", value=format_money(operation_result), inline=False)
+    embed.add_field(name="入金除外リターン", value=f"{return_excluding_deposits_rate:+.2f}%", inline=False)
+    embed.add_field(name="年20%目標額", value=format_money(target_amount), inline=False)
+    embed.add_field(name="目標との差分", value=format_money(target_diff), inline=False)
+    embed.add_field(name="試算の扱い", value="試算ポジションはこのレビューの総資産に含めません。", inline=False)
     embed.set_footer(text=f"レビュー日時: {datetime.now().strftime('%Y年%m月%d日 %H:%M')}")
-    
     await interaction.response.send_message(embed=embed)
 
 
-@tree.command(
-    name="ヘルプ",
-    description="使用可能なコマンド一覧"
-)
+@tree.command(name="ヘルプ", description="使用可能なコマンド一覧")
 async def help_command(interaction: discord.Interaction):
-    """ヘルプコマンド"""
-    embed = discord.Embed(
-        title="💡 投資管理Bot - ヘルプ",
-        color=discord.Color.lighter_gray()
-    )
-    
+    embed = discord.Embed(title="💡 投資台帳Bot - ヘルプ", color=discord.Color.lighter_gray())
     commands_info = [
-        ("/資産 金額", "現在の総資産を記録・確認します"),
-        ("/入金 金額", "入金を記録します"),
-        ("/保有 銘柄 株数 取得単価 通貨", "保有銘柄を登録します"),
+        ("/一括反映", "複数行テキストを確認後に一括登録します"),
+        ("/資産設定 金額 YYYY-MM-DD", "基準資産・基準日・現在資産を設定します"),
+        ("/入金 金額 通貨", "入金を台帳に記録します"),
+        ("/出金 金額 通貨", "出金を台帳に記録します"),
+        ("/買い 銘柄 株数 価格 通貨", "買い取引を記録し、平均取得単価を更新します"),
+        ("/売り 銘柄 株数 価格 通貨", "売り取引を記録し、保有数量を減らします"),
+        ("/履歴", "直近の取引履歴を表示します"),
+        ("/保有", "保有一覧を表示します。引数ありなら初期登録や修正をします"),
+        ("/試算", "試算ポジションを表示します"),
+        ("/試算登録 銘柄 株数 価格 通貨", "試算ポジションを登録します"),
+        ("/試算削除 銘柄", "試算ポジションを削除します"),
+        ("/更新 金額 または /更新 銘柄 現在価格", "総資産または現在価格を更新します"),
+        ("/レビュー", "入出金と資産から運用状況をレビューします"),
+        ("/目標", "年率20%目標との差分を表示します"),
         ("/仮説 銘柄", "保存済みの投資仮説を確認します"),
         ("/仮説登録 銘柄 保有理由 期待数字 買い増し条件 損切り条件", "投資仮説を登録・更新します"),
         ("/判定 銘柄", "銘柄の判定と資産比率を表示します"),
         ("/比率", "保有銘柄の資産比率を表示します"),
-        ("/目標", "年率20%達成に必要な資産額を表示します"),
-        ("/レビュー", "投資状況のレビューを表示します"),
-        ("/ヘルプ", "このメッセージを表示します"),
     ]
-    
     for cmd, desc in commands_info:
         embed.add_field(name=cmd, value=desc, inline=False)
-    
-    embed.set_footer(text="基準日: 2026年06月09日 | 基準資産: ¥7,096,249")
-    
+    embed.set_footer(text=f"基準日: {BASE_DATE.strftime('%Y年%m月%d日')} | 基準資産: ¥{BASE_ASSET:,}")
     await interaction.response.send_message(embed=embed)
 
 
@@ -583,8 +766,8 @@ def main():
         print("❌ エラー: DISCORD_TOKENが設定されていません")
         print("📝 .env ファイルを作成し、DISCORD_TOKEN=<your_token> を追加してください")
         return
-    
-    print("🤖 投資管理Botを起動しています...")
+
+    print("🤖 投資台帳Botを起動しています...")
     bot.run(token)
 
 
