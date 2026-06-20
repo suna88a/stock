@@ -7,6 +7,7 @@ from config import BASE_ASSET, BASE_DATE
 from database import InvestmentDatabase
 from price_fetcher import normalize_ticker
 from time_utils import format_datetime_jst
+from bot import build_daily_report_embeds
 
 
 def assert_equal(actual, expected, label):
@@ -123,6 +124,28 @@ def main():
         assert_close(simulation['day_change_rate'], 0.5 / 9.5, 'simulation day change rate')
 
         assert_equal(format_datetime_jst('2026-06-18 15:22:19'), '2026-06-19 00:22:19', 'jst formatting')
+
+        report_data = {
+            'current_asset': 6811322,
+            'initial_asset': BASE_ASSET,
+            'cash_flow': {'deposit_total': 500000, 'withdraw_total': 100000, 'net_deposit': 400000},
+            'asset_change': {'change': 11322, 'change_rate': 11322 / 6800000, 'currency': 'JPY'},
+            'operation_result': 6811322 - BASE_ASSET - 400000,
+            'return_rate': ((6811322 - BASE_ASSET - 400000) / BASE_ASSET) * 100,
+            'target_amount': BASE_ASSET * 1.2,
+            'target_diff': 6811322 - (BASE_ASSET * 1.2),
+            'breakdowns': [
+                {'name': '国内株式', 'amount': 994000, 'currency': 'JPY'},
+                {'name': '米国株式', 'amount': 2995660, 'currency': 'JPY'},
+            ],
+            'holdings': [db.get_holding_by_symbol(user_id, 'NET')],
+            'simulations': db.get_simulations(user_id),
+            'update_result': {'usdjpy': 157.2, 'failed': []},
+            'generated_at': BASE_DATE,
+        }
+        embeds = build_daily_report_embeds(report_data)
+        assert_equal(len(embeds), 3, 'daily report embed count')
+        assert_equal(embeds[0].title, '📊 日次資産レポート', 'daily report title')
 
         legacy_user_id = 67890
         conn = sqlite3.connect(db_path)

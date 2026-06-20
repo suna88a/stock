@@ -10,6 +10,8 @@ load_dotenv(dotenv_path, encoding='utf-8-sig')
 
 # Discord Bot
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN', 'your_token_here')
+DAILY_REPORT_CHANNEL_ID = os.getenv('DAILY_REPORT_CHANNEL_ID', '')
+DAILY_REPORT_USER_ID = os.getenv('DAILY_REPORT_USER_ID', '')
 
 # 投資管理設定
 BASE_DATE = datetime(2026, 6, 9)  # 基準日

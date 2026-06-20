@@ -125,11 +125,96 @@ class InvestmentDatabase:
             )
         ''')
 
+        # 投資判断シナリオテーブル
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS investment_scenarios (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                ticker TEXT NOT NULL,
+                company_name TEXT,
+                market_type TEXT,
+                position_type TEXT,
+                investment_amount REAL,
+                portfolio_weight REAL,
+                buy_reason TEXT,
+                business_thesis TEXT,
+                market_mispricing TEXT,
+                growth_thesis TEXT,
+                capital_flow_reason TEXT,
+                next_earnings_watch TEXT,
+                hold_condition TEXT,
+                reduce_condition TEXT,
+                exit_condition TEXT,
+                max_loss_amount REAL,
+                earnings_date TEXT,
+                review_date TEXT,
+                memo TEXT,
+                active INTEGER DEFAULT 1,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        # 将来の履歴表示・差分比較に備えて更新前スナップショットを保存
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS scenario_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scenario_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                ticker TEXT NOT NULL,
+                company_name TEXT,
+                market_type TEXT,
+                position_type TEXT,
+                investment_amount REAL,
+                portfolio_weight REAL,
+                buy_reason TEXT,
+                business_thesis TEXT,
+                market_mispricing TEXT,
+                growth_thesis TEXT,
+                capital_flow_reason TEXT,
+                next_earnings_watch TEXT,
+                hold_condition TEXT,
+                reduce_condition TEXT,
+                exit_condition TEXT,
+                max_loss_amount REAL,
+                earnings_date TEXT,
+                review_date TEXT,
+                memo TEXT,
+                active INTEGER,
+                created_at TEXT,
+                updated_at TEXT,
+                archived_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
+        # 売却判断記録テーブル
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS sell_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                ticker TEXT NOT NULL,
+                company_name TEXT,
+                sell_date TEXT,
+                sell_quantity REAL,
+                sell_amount REAL,
+                reason_category TEXT NOT NULL,
+                reason_detail TEXT,
+                scenario_status_at_sell TEXT,
+                emotion_at_sell TEXT,
+                reflection TEXT,
+                memo TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+
         self._ensure_column(cursor, 'holdings', 'current_price', 'REAL')
         self._ensure_position_columns(cursor, 'holdings')
         self._ensure_position_columns(cursor, 'simulations')
         self._ensure_column(cursor, 'user_assets', 'initial_asset', 'INTEGER')
         self._ensure_column(cursor, 'user_assets', 'base_date', 'TEXT')
+        self._ensure_column(cursor, 'investment_scenarios', 'user_id', 'INTEGER')
+        self._ensure_column(cursor, 'sell_records', 'user_id', 'INTEGER')
         
         conn.commit()
         conn.close()
@@ -254,6 +339,203 @@ class InvestmentDatabase:
             'currency': rows[0][1] or 'JPY',
             'updated_at': rows[0][2],
         }
+
+    def _scenario_from_row(self, row):
+        if not row:
+            return None
+        keys = [
+            'id', 'user_id', 'ticker', 'company_name', 'market_type', 'position_type',
+            'investment_amount', 'portfolio_weight', 'buy_reason', 'business_thesis',
+            'market_mispricing', 'growth_thesis', 'capital_flow_reason',
+            'next_earnings_watch', 'hold_condition', 'reduce_condition',
+            'exit_condition', 'max_loss_amount', 'earnings_date', 'review_date',
+            'memo', 'active', 'created_at', 'updated_at'
+        ]
+        return dict(zip(keys, row))
+
+    def _insert_scenario_history(self, cursor, row):
+        scenario = self._scenario_from_row(row)
+        if not scenario:
+            return
+        cursor.execute('''
+            INSERT INTO scenario_history (
+                scenario_id, user_id, ticker, company_name, market_type, position_type,
+                investment_amount, portfolio_weight, buy_reason, business_thesis,
+                market_mispricing, growth_thesis, capital_flow_reason,
+                next_earnings_watch, hold_condition, reduce_condition,
+                exit_condition, max_loss_amount, earnings_date, review_date,
+                memo, active, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            scenario['id'], scenario['user_id'], scenario['ticker'], scenario['company_name'],
+            scenario['market_type'], scenario['position_type'], scenario['investment_amount'],
+            scenario['portfolio_weight'], scenario['buy_reason'], scenario['business_thesis'],
+            scenario['market_mispricing'], scenario['growth_thesis'], scenario['capital_flow_reason'],
+            scenario['next_earnings_watch'], scenario['hold_condition'], scenario['reduce_condition'],
+            scenario['exit_condition'], scenario['max_loss_amount'], scenario['earnings_date'],
+            scenario['review_date'], scenario['memo'], scenario['active'], scenario['created_at'],
+            scenario['updated_at'],
+        ))
+
+    def add_or_update_scenario(self, user_id, data, save_history=True):
+        """投資シナリオを登録・更新"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        ticker = data['ticker'].upper()
+        cursor.execute('''
+            SELECT
+                id, user_id, ticker, company_name, market_type, position_type,
+                investment_amount, portfolio_weight, buy_reason, business_thesis,
+                market_mispricing, growth_thesis, capital_flow_reason,
+                next_earnings_watch, hold_condition, reduce_condition,
+                exit_condition, max_loss_amount, earnings_date, review_date,
+                memo, active, created_at, updated_at
+            FROM investment_scenarios
+            WHERE user_id = ? AND ticker = ?
+            ORDER BY active DESC, updated_at DESC, id DESC
+            LIMIT 1
+        ''', (user_id, ticker))
+        existing = cursor.fetchone()
+
+        values = (
+            data.get('company_name'), data.get('market_type'), data.get('position_type'),
+            data.get('investment_amount'), data.get('portfolio_weight'), data.get('buy_reason'),
+            data.get('business_thesis'), data.get('market_mispricing'), data.get('growth_thesis'),
+            data.get('capital_flow_reason'), data.get('next_earnings_watch'),
+            data.get('hold_condition'), data.get('reduce_condition'), data.get('exit_condition'),
+            data.get('max_loss_amount'), data.get('earnings_date'), data.get('review_date'),
+            data.get('memo'), 1 if data.get('active', True) else 0,
+        )
+
+        if existing:
+            if save_history:
+                self._insert_scenario_history(cursor, existing)
+            cursor.execute('''
+                UPDATE investment_scenarios
+                SET company_name = ?, market_type = ?, position_type = ?,
+                    investment_amount = ?, portfolio_weight = ?, buy_reason = ?,
+                    business_thesis = ?, market_mispricing = ?, growth_thesis = ?,
+                    capital_flow_reason = ?, next_earnings_watch = ?,
+                    hold_condition = ?, reduce_condition = ?, exit_condition = ?,
+                    max_loss_amount = ?, earnings_date = ?, review_date = ?,
+                    memo = ?, active = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            ''', values + (existing[0],))
+            scenario_id = existing[0]
+        else:
+            cursor.execute('''
+                INSERT INTO investment_scenarios (
+                    user_id, ticker, company_name, market_type, position_type,
+                    investment_amount, portfolio_weight, buy_reason, business_thesis,
+                    market_mispricing, growth_thesis, capital_flow_reason,
+                    next_earnings_watch, hold_condition, reduce_condition,
+                    exit_condition, max_loss_amount, earnings_date, review_date,
+                    memo, active
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (user_id, ticker) + values)
+            scenario_id = cursor.lastrowid
+
+        conn.commit()
+        conn.close()
+        return self.get_scenario_by_ticker(user_id, ticker, active_only=False) or {'id': scenario_id}
+
+    def get_scenario_by_ticker(self, user_id, ticker, active_only=True):
+        """銘柄コードから投資シナリオを取得"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        query = '''
+            SELECT
+                id, user_id, ticker, company_name, market_type, position_type,
+                investment_amount, portfolio_weight, buy_reason, business_thesis,
+                market_mispricing, growth_thesis, capital_flow_reason,
+                next_earnings_watch, hold_condition, reduce_condition,
+                exit_condition, max_loss_amount, earnings_date, review_date,
+                memo, active, created_at, updated_at
+            FROM investment_scenarios
+            WHERE user_id = ? AND ticker = ?
+        '''
+        params = [user_id, ticker.upper()]
+        if active_only:
+            query += ' AND active = 1'
+        query += ' ORDER BY active DESC, updated_at DESC, id DESC LIMIT 1'
+        cursor.execute(query, params)
+        row = cursor.fetchone()
+        conn.close()
+        return self._scenario_from_row(row)
+
+    def get_active_scenarios(self, user_id):
+        """有効な投資シナリオ一覧を取得"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT
+                id, user_id, ticker, company_name, market_type, position_type,
+                investment_amount, portfolio_weight, buy_reason, business_thesis,
+                market_mispricing, growth_thesis, capital_flow_reason,
+                next_earnings_watch, hold_condition, reduce_condition,
+                exit_condition, max_loss_amount, earnings_date, review_date,
+                memo, active, created_at, updated_at
+            FROM investment_scenarios
+            WHERE user_id = ? AND active = 1
+            ORDER BY
+                CASE position_type
+                    WHEN '超主力' THEN 1
+                    WHEN '主力' THEN 2
+                    WHEN '準主力' THEN 3
+                    WHEN '観察枠' THEN 4
+                    ELSE 99
+                END,
+                ticker
+        ''', (user_id,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [self._scenario_from_row(row) for row in rows]
+
+    def add_sell_record(self, user_id, data):
+        """売却判断を記録"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO sell_records (
+                user_id, ticker, company_name, sell_date, sell_quantity, sell_amount,
+                reason_category, reason_detail, scenario_status_at_sell,
+                emotion_at_sell, reflection, memo
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            user_id,
+            data['ticker'].upper(),
+            data.get('company_name'),
+            data.get('sell_date'),
+            data.get('sell_quantity'),
+            data.get('sell_amount'),
+            data['reason_category'],
+            data.get('reason_detail'),
+            data.get('scenario_status_at_sell'),
+            data.get('emotion_at_sell'),
+            data.get('reflection'),
+            data.get('memo'),
+        ))
+        record_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return record_id
+
+    def get_latest_user_id(self):
+        """日次レポート用に直近更新ユーザーを取得"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT user_id
+            FROM user_assets
+            ORDER BY last_updated DESC, id DESC
+            LIMIT 1
+        ''')
+        result = cursor.fetchone()
+        conn.close()
+        return result[0] if result else None
 
     def set_base_asset(self, user_id, initial_asset, base_date):
         """基準資産・基準日・現在資産を設定"""
