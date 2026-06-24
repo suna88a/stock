@@ -154,9 +154,14 @@ def main():
         holding_field = embeds[1].fields[0]
         assert_equal(holding_field.name, 'NET / Cloudflare', 'daily report holding display name')
         assert_equal(holding_field.value.startswith('```text'), True, 'daily report holding code block')
-        assert_equal('前日比' in holding_field.value, True, 'daily report holding day change row')
+        assert_equal('前日   ' in holding_field.value, True, 'daily report holding day change row')
         assert_equal('+¥23,580' in holding_field.value, True, 'daily report holding day change jpy')
         assert_equal('円換算評価額' in holding_field.value, False, 'daily report omits jpy value duplicate')
+        assert_equal('平均取得単価' in holding_field.value, False, 'daily report uses compact labels')
+        summary_value = embeds[0].fields[0].value
+        assert_equal('現在 ' in summary_value, True, 'daily report compact summary')
+        risk_value = next(field.value for field in embeds[0].fields if field.name == 'リスク概要')
+        assert_equal('最大 NET' in risk_value, True, 'daily report compact risk summary')
 
         assert_equal(risk_data['current_asset'], 6811322, 'risk current asset')
         assert_equal(risk_data['holding_ratios'][0]['symbol'], 'NET', 'risk top holding')

@@ -203,8 +203,8 @@ def format_report_price(amount, currency):
 
 def format_daily_position_row(label, value, rate=None):
     if rate is None:
-        return f"{label:<14}{value}"
-    return f"{label:<14}{value:<14}{rate}"
+        return f"{label}   {value}"
+    return f"{label}   {value} / {rate}"
 
 
 def daily_day_change_jpy(item, usdjpy=None):
@@ -237,10 +237,10 @@ def format_daily_holding_value(item, usdjpy=None):
     lines = [
         holding_display_name(item),
         format_daily_position_row('株数', f"{item.get('quantity', 0):,.1f}"),
-        format_daily_position_row('平均取得単価', format_report_price(entry_price, item.get('currency', currency))),
-        format_daily_position_row('現在価格', format_report_price(current_price, currency)),
-        format_daily_position_row('前日比', format_signed_money(day_change_jpy) if day_change_jpy is not None else '-', day_rate),
-        format_daily_position_row('評価損益', format_signed_money(pnl_jpy) if pnl_jpy is not None else '-', f"{pnl_rate:+.2f}%" if pnl_rate is not None else '-'),
+        format_daily_position_row('取得', format_report_price(entry_price, item.get('currency', currency))),
+        format_daily_position_row('現在', format_report_price(current_price, currency)),
+        format_daily_position_row('前日', format_signed_money(day_change_jpy) if day_change_jpy is not None else '-', day_rate),
+        format_daily_position_row('損益', format_signed_money(pnl_jpy) if pnl_jpy is not None else '-', f"{pnl_rate:+.2f}%" if pnl_rate is not None else '-'),
     ]
     return "```text\n" + "\n".join(lines) + "\n```"
 
@@ -1095,31 +1095,34 @@ def format_daily_risk_summary(risk):
     if top_holding:
         approx = "（概算）" if top_holding.get('approximate') else ""
         lines.append(
-            f"最大保有: {top_holding['symbol']} {format_money(top_holding['value_jpy'])} "
-            f"/ {format_percent(top_holding['ratio'])}{approx}"
+            f"最大 {top_holding['symbol']}"
+        )
+        lines.append(
+            f"{format_money(top_holding['value_jpy'])} / {format_percent(top_holding['ratio'])}{approx}"
         )
     else:
-        lines.append("最大保有: -")
+        lines.append("最大 -")
 
-    lines.append(f"現金比率: {format_money(risk.get('cash_amount'))} / {format_percent(risk.get('cash_ratio'))}")
+    lines.append(f"現金 {format_money(risk.get('cash_amount'))} / {format_percent(risk.get('cash_ratio'))}")
 
     currency_amounts = risk.get('currency_amounts') or {}
     jpy_amount = currency_amounts.get('JPY') or 0
     usd_amount = currency_amounts.get('USD') or 0
     jpy_ratio = jpy_amount / current_asset if current_asset else 0
     usd_ratio = usd_amount / current_asset if current_asset else 0
-    lines.append(f"通貨比率: JPY {format_percent(jpy_ratio)} / USD {format_percent(usd_ratio)}")
+    lines.append(f"通貨 JPY {format_percent(jpy_ratio)}")
+    lines.append(f"通貨 USD {format_percent(usd_ratio)}")
 
     top_scenario = risk.get('decline_scenarios', [None])[0]
     if top_scenario:
-        scenario_texts = [
-            f"-{scenario['decline_rate'] * 100:.0f}% → {format_signed_money(-scenario['loss'])} "
-            f"({format_percent(-scenario['impact_rate'], signed=True)})"
-            for scenario in top_scenario['scenarios']
-        ]
-        lines.append(f"{top_scenario['symbol']} 下落影響: " + " / ".join(scenario_texts))
+        lines.append(f"{top_scenario['symbol']} 下落影響")
+        for scenario in top_scenario['scenarios']:
+            lines.append(
+                f"-{scenario['decline_rate'] * 100:.0f}% {format_signed_money(-scenario['loss'])} "
+                f"/ {format_percent(-scenario['impact_rate'], signed=True)}"
+            )
     else:
-        lines.append("下落影響: -")
+        lines.append("下落 -")
     return '\n'.join(lines)
 
 
@@ -1323,16 +1326,16 @@ def build_daily_report_embeds(report_data):
     summary.add_field(
         name="資産サマリー",
         value=(
-            f"現在資産: {format_money(report_data['current_asset'])}\n"
-            f"前回比: {format_asset_change(report_data['asset_change'])}\n"
-            f"基準資産: {format_money(report_data['initial_asset'])}\n"
-            f"入金合計: {format_money(report_data['cash_flow']['deposit_total'])}\n"
-            f"出金合計: {format_money(report_data['cash_flow']['withdraw_total'])}\n"
-            f"純入金額: {format_money(report_data['cash_flow']['net_deposit'])}\n"
-            f"運用成果: {format_money(report_data['operation_result'])}\n"
-            f"入金除外リターン: {report_data['return_rate']:+.2f}%\n"
-            f"年20%目標額: {format_money(report_data['target_amount'])}\n"
-            f"目標との差分: {format_money(report_data['target_diff'])}"
+            f"現在 {format_money(report_data['current_asset'])}\n"
+            f"前回 {format_asset_change(report_data['asset_change'])}\n"
+            f"基準 {format_money(report_data['initial_asset'])}\n"
+            f"入金 {format_money(report_data['cash_flow']['deposit_total'])}\n"
+            f"出金 {format_money(report_data['cash_flow']['withdraw_total'])}\n"
+            f"純入金 {format_money(report_data['cash_flow']['net_deposit'])}\n"
+            f"成果 {format_money(report_data['operation_result'])}\n"
+            f"除外R {report_data['return_rate']:+.2f}%\n"
+            f"目標 {format_money(report_data['target_amount'])}\n"
+            f"差分 {format_money(report_data['target_diff'])}"
         ),
         inline=False,
     )
