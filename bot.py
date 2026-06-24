@@ -24,6 +24,13 @@ bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
 db = InvestmentDatabase()
 daily_report_last_sent_date = None
+DEFAULT_TICKER_NAMES = {
+    '4633': 'サカタインクス',
+    '4755': '楽天グループ',
+    'AMZN': 'Amazon',
+    'NET': 'Cloudflare',
+    'NVDA': 'NVIDIA',
+}
 
 
 @bot.event
@@ -178,6 +185,64 @@ def format_position_value(item, entry_label='平均取得単価', quantity_label
     if item.get('memo'):
         lines.append(f"memo: {item['memo']}")
     return '\n'.join(lines)
+
+
+def holding_display_name(item):
+    symbol = item.get('symbol') or item.get('ticker') or ''
+    name = item.get('name') or item.get('company_name') or item.get('memo') or DEFAULT_TICKER_NAMES.get(symbol.upper())
+    return f"{symbol} / {name}" if name else symbol
+
+
+def format_report_price(amount, currency):
+    if amount is None:
+        return '-'
+    if currency == 'JPY':
+        return f"{amount:,.0f} JPY"
+    return f"{amount:,.4f}".rstrip('0').rstrip('.') + f" {currency}"
+
+
+def format_daily_position_row(label, value, rate=None):
+    if rate is None:
+        return f"{label:<14}{value}"
+    return f"{label:<14}{value:<14}{rate}"
+
+
+def daily_day_change_jpy(item, usdjpy=None):
+    day_change = item.get('day_change')
+    quantity = item.get('quantity') or 0
+    currency = position_currency(item)
+    if day_change is None:
+        return None
+    if currency == 'JPY':
+        return day_change * quantity
+    if currency == 'USD' and usdjpy:
+        return day_change * quantity * usdjpy
+    return None
+
+
+def format_daily_holding_value(item, usdjpy=None):
+    currency = position_currency(item)
+    entry_price = item.get('purchase_price')
+    current_price = item.get('current_price') if item.get('current_price') is not None else entry_price
+    day_change_jpy = daily_day_change_jpy(item, usdjpy=usdjpy)
+    day_rate = format_rate(item.get('day_change_rate'))
+    pnl_jpy = item.get('unrealized_pnl_jpy')
+    pnl_rate = item.get('unrealized_pnl_rate')
+    if pnl_jpy is None and item.get('unrealized_pnl') is not None:
+        if currency == 'JPY':
+            pnl_jpy = item['unrealized_pnl']
+        elif currency == 'USD' and usdjpy:
+            pnl_jpy = item['unrealized_pnl'] * usdjpy
+
+    lines = [
+        holding_display_name(item),
+        format_daily_position_row('株数', f"{item.get('quantity', 0):,.1f}"),
+        format_daily_position_row('平均取得単価', format_report_price(entry_price, item.get('currency', currency))),
+        format_daily_position_row('現在価格', format_report_price(current_price, currency)),
+        format_daily_position_row('前日比', format_signed_money(day_change_jpy) if day_change_jpy is not None else '-', day_rate),
+        format_daily_position_row('評価損益', format_signed_money(pnl_jpy) if pnl_jpy is not None else '-', f"{pnl_rate:+.2f}%" if pnl_rate is not None else '-'),
+    ]
+    return "```text\n" + "\n".join(lines) + "\n```"
 
 
 def clean_number(value):
@@ -1184,6 +1249,37 @@ def _build_position_embeds(title, items, name_key, entry_label='平均取得単�
     return embeds
 
 
+def _build_daily_holding_embeds(items, usdjpy=None):
+    if not items:
+        embed = discord.Embed(title="保有銘柄", description="なし", color=discord.Color.green())
+        return [embed]
+
+    embeds = []
+    for index in range(0, len(items), 25):
+        chunk = items[index:index + 25]
+        suffix = f" {index // 25 + 1}" if index else ""
+        embed = discord.Embed(title=f"保有銘柄{suffix}", color=discord.Color.green())
+        for item in chunk:
+            embed.add_field(
+                name=holding_display_name(item),
+                value=format_daily_holding_value(item, usdjpy=usdjpy)[:1024],
+                inline=False,
+            )
+        embeds.append(embed)
+    return embeds
+
+
+def enrich_holding_display_names(user_id, holdings):
+    enriched = []
+    for holding in holdings:
+        item = dict(holding)
+        scenario = db.get_scenario_by_ticker(user_id, item['symbol'], active_only=False)
+        if scenario and scenario.get('company_name'):
+            item['company_name'] = scenario['company_name']
+        enriched.append(item)
+    return enriched
+
+
 def build_daily_report_data(user_id, update_result=None):
     asset_info = db.get_asset(user_id)
     initial_asset, base_date = asset_base_values(asset_info)
@@ -1209,7 +1305,7 @@ def build_daily_report_data(user_id, update_result=None):
         'target_amount': target_amount,
         'target_diff': target_diff,
         'breakdowns': db.get_asset_breakdowns(user_id),
-        'holdings': db.get_holdings(user_id),
+        'holdings': enrich_holding_display_names(user_id, db.get_holdings(user_id)),
         'simulations': db.get_simulations(user_id),
         'risk_data': build_portfolio_risk_data(user_id, usdjpy=(update_result or {}).get('usdjpy')),
         'update_result': update_result or {},
@@ -1260,7 +1356,7 @@ def build_daily_report_embeds(report_data):
     )
     embeds.append(summary)
 
-    embeds.extend(_build_position_embeds("保有銘柄", report_data['holdings'], 'symbol', color=discord.Color.green()))
+    embeds.extend(_build_daily_holding_embeds(report_data['holdings'], usdjpy=usdjpy))
     embeds.extend(_build_position_embeds(
         "試算",
         report_data['simulations'],
