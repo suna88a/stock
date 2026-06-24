@@ -859,7 +859,7 @@ def create_asset_embed(user_id, total_asset=None):
     return embed
 
 
-def estimate_holding_value_jpy(holding):
+def estimate_holding_value_jpy(holding, usdjpy=None):
     value_jpy = holding.get('current_value_jpy')
     if value_jpy is not None:
         return value_jpy, False
@@ -873,10 +873,12 @@ def estimate_holding_value_jpy(holding):
         return None, True
     if currency == 'JPY':
         return quantity * price, True
+    if currency == 'USD' and usdjpy:
+        return quantity * price * usdjpy, True
     return None, True
 
 
-def build_portfolio_risk_data(user_id, database=None):
+def build_portfolio_risk_data(user_id, database=None, usdjpy=None):
     database = database or db
     asset_info = database.get_asset(user_id)
     current_asset = asset_info['total_asset'] if asset_info else 0
@@ -886,7 +888,7 @@ def build_portfolio_risk_data(user_id, database=None):
     holding_ratios = []
     approximate = False
     for holding in holdings:
-        value_jpy, is_approx = estimate_holding_value_jpy(holding)
+        value_jpy, is_approx = estimate_holding_value_jpy(holding, usdjpy=usdjpy)
         if value_jpy is None:
             approximate = True
             continue
@@ -959,8 +961,9 @@ def build_portfolio_risk_data(user_id, database=None):
     }
 
 
-def create_risk_embed(user_id):
-    risk = build_portfolio_risk_data(user_id)
+def create_risk_embed(user_id, update_result=None):
+    update_result = update_result or {}
+    risk = build_portfolio_risk_data(user_id, usdjpy=update_result.get('usdjpy'))
     current_asset = risk['current_asset']
     embed = discord.Embed(title="ポートフォリオ・リスク管理", color=discord.Color.orange())
     embed.add_field(name="現在資産", value=format_money(current_asset), inline=False)
@@ -1014,6 +1017,8 @@ def create_risk_embed(user_id):
     footer = "売買推奨ではなく、集中度と下落耐性の可視化です。"
     if risk['approximate']:
         footer += " current_value_jpy がない銘柄は取得単価ベースの概算または除外です。"
+    if update_result.get('failed'):
+        footer += f" 価格取得失敗: {', '.join(update_result['failed'][:5])}"
     embed.set_footer(text=footer)
     return embed
 
@@ -1206,7 +1211,7 @@ def build_daily_report_data(user_id, update_result=None):
         'breakdowns': db.get_asset_breakdowns(user_id),
         'holdings': db.get_holdings(user_id),
         'simulations': db.get_simulations(user_id),
-        'risk_data': build_portfolio_risk_data(user_id),
+        'risk_data': build_portfolio_risk_data(user_id, usdjpy=(update_result or {}).get('usdjpy')),
         'update_result': update_result or {},
         'generated_at': now_jst(),
     }
@@ -1668,7 +1673,9 @@ async def show_goal(interaction: discord.Interaction):
 async def show_risk(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
     try:
-        await interaction.followup.send(embed=create_risk_embed(interaction.user.id))
+        user_id = interaction.user.id
+        update_result = await update_market_prices(user_id)
+        await interaction.followup.send(embed=create_risk_embed(user_id, update_result=update_result))
     except Exception as exc:
         await interaction.followup.send(f"リスク表示中にエラーが発生しました: {exc}")
 

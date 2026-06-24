@@ -126,7 +126,8 @@ def main():
 
         assert_equal(format_datetime_jst('2026-06-18 15:22:19'), '2026-06-19 00:22:19', 'jst formatting')
 
-        risk_data = build_portfolio_risk_data(user_id, db)
+        db.add_holding(user_id, 'AMZN', 5, 238.55, 'USD')
+        risk_data = build_portfolio_risk_data(user_id, db, usdjpy=157.2)
         report_data = {
             'current_asset': 6811322,
             'initial_asset': BASE_ASSET,
@@ -153,6 +154,11 @@ def main():
 
         assert_equal(risk_data['current_asset'], 6811322, 'risk current asset')
         assert_equal(risk_data['holding_ratios'][0]['symbol'], 'NET', 'risk top holding')
+        risk_symbols = {item['symbol'] for item in risk_data['holding_ratios']}
+        assert_equal('AMZN' in risk_symbols, True, 'risk includes usd holding fallback')
+        amzn_risk = next(item for item in risk_data['holding_ratios'] if item['symbol'] == 'AMZN')
+        assert_equal(amzn_risk['approximate'], True, 'risk usd fallback is approximate')
+        assert_close(amzn_risk['value_jpy'], 5 * 238.55 * 157.2, 'risk usd fallback value')
         assert_close(risk_data['cash_amount'], 381645 + 35132, 'risk cash amount')
         assert_close(risk_data['cash_ratio'], (381645 + 35132) / 6811322, 'risk cash ratio')
         assert_close(risk_data['currency_amounts']['JPY'], 994000 + 2404885 + 381645, 'risk jpy amount')
