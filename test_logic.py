@@ -159,6 +159,8 @@ def main():
         assert_equal('円換算評価額' in holding_field.value, False, 'daily report omits jpy value duplicate')
         assert_equal('平均取得単価' in holding_field.value, False, 'daily report uses compact labels')
         summary_value = embeds[0].fields[0].value
+        assert_equal(summary_value.startswith('\n'), True, 'daily report summary starts with blank line')
+        assert_equal(summary_value.endswith('\n'), True, 'daily report summary ends with blank line')
         assert_equal('現在 ' in summary_value, True, 'daily report compact summary')
         assert_equal('入金 ' in summary_value, False, 'daily report omits deposit')
         assert_equal('出金 ' in summary_value, False, 'daily report omits withdraw')
@@ -166,6 +168,7 @@ def main():
         assert_equal('除外R' in summary_value, False, 'daily report omits return excluding deposits')
         assert_equal('成果 🟢' in summary_value, True, 'daily report operation result icon')
         risk_value = next(field.value for field in embeds[0].fields if field.name == 'リスク概要')
+        assert_equal('\nNET 下落影響' in risk_value, True, 'daily report separates decline section')
         assert_equal('最大 NET' in risk_value, True, 'daily report compact risk summary')
         assert_equal('🟡' in risk_value, True, 'daily report risk warning icon')
 

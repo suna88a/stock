@@ -1138,6 +1138,7 @@ def format_daily_risk_summary(risk):
 
     top_scenario = risk.get('decline_scenarios', [None])[0]
     if top_scenario:
+        lines.append("")
         lines.append(f"{top_scenario['symbol']} 下落影響")
         for scenario in top_scenario['scenarios']:
             lines.append(
@@ -1255,6 +1256,10 @@ def _truncate_lines(lines, limit=1000):
     return '\n'.join(trimmed)
 
 
+def pad_daily_section(text):
+    return f"\n{text}\n"
+
+
 def _build_position_embeds(title, items, name_key, entry_label='平均取得単価', quantity_label='株数', color=discord.Color.green()):
     if not items:
         embed = discord.Embed(title=title, description="なし", color=color)
@@ -1265,6 +1270,7 @@ def _build_position_embeds(title, items, name_key, entry_label='平均取得単�
         chunk = items[index:index + 25]
         suffix = f" {index // 25 + 1}" if index else ""
         embed = discord.Embed(title=f"{title}{suffix}", color=color)
+        embed.description = "\u200b"
         for item in chunk:
             embed.add_field(
                 name=item[name_key],
@@ -1285,6 +1291,7 @@ def _build_daily_holding_embeds(items, usdjpy=None):
         chunk = items[index:index + 25]
         suffix = f" {index // 25 + 1}" if index else ""
         embed = discord.Embed(title=f"保有銘柄{suffix}", color=discord.Color.green())
+        embed.description = "\u200b"
         for item in chunk:
             embed.add_field(
                 name=holding_display_name(item),
@@ -1345,10 +1352,10 @@ def build_daily_report_embeds(report_data):
     usdjpy = update_result.get('usdjpy')
     failed = update_result.get('failed') or []
 
-    summary = discord.Embed(title="📊 日次資産レポート", color=discord.Color.blue())
+    summary = discord.Embed(title="📊 日次資産レポート", description="\u200b", color=discord.Color.blue())
     summary.add_field(
         name="資産サマリー",
-        value=(
+        value=pad_daily_section(
             f"現在 {format_money(report_data['current_asset'])}\n"
             f"前回 {format_daily_asset_change(report_data['asset_change'])}\n"
             f"基準 {format_money(report_data['initial_asset'])}\n"
@@ -1364,18 +1371,18 @@ def build_daily_report_embeds(report_data):
         f"{item['name']}: {format_money(item['amount'], item['currency'])}"
         for item in report_data['breakdowns']
     ]
-    summary.add_field(name="資産内訳", value=_truncate_lines(breakdown_lines), inline=False)
+    summary.add_field(name="資産内訳", value=pad_daily_section(_truncate_lines(breakdown_lines)), inline=False)
     risk_data = report_data.get('risk_data')
     if risk_data:
-        summary.add_field(name="リスク概要", value=format_daily_risk_summary(risk_data)[:1000], inline=False)
+        summary.add_field(name="リスク概要", value=pad_daily_section(format_daily_risk_summary(risk_data)[:1000]), inline=False)
     summary.add_field(
         name="更新情報",
-        value=(
+        value=pad_daily_section((
             f"USDJPY: {usdjpy:.2f}" if usdjpy else "USDJPY: 取得失敗"
         ) + (
             f"\n更新日時: {report_data['generated_at'].strftime('%Y-%m-%d %H:%M:%S')}"
             f"\n価格取得失敗: {', '.join(failed) if failed else 'なし'}"
-        ),
+        )),
         inline=False,
     )
     embeds.append(summary)
