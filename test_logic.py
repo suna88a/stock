@@ -160,8 +160,14 @@ def main():
         assert_equal('平均取得単価' in holding_field.value, False, 'daily report uses compact labels')
         summary_value = embeds[0].fields[0].value
         assert_equal('現在 ' in summary_value, True, 'daily report compact summary')
+        assert_equal('入金 ' in summary_value, False, 'daily report omits deposit')
+        assert_equal('出金 ' in summary_value, False, 'daily report omits withdraw')
+        assert_equal('純入金 ' in summary_value, False, 'daily report omits net deposit')
+        assert_equal('除外R' in summary_value, False, 'daily report omits return excluding deposits')
+        assert_equal('成果 🟢' in summary_value, True, 'daily report operation result icon')
         risk_value = next(field.value for field in embeds[0].fields if field.name == 'リスク概要')
         assert_equal('最大 NET' in risk_value, True, 'daily report compact risk summary')
+        assert_equal('🟡' in risk_value, True, 'daily report risk warning icon')
 
         assert_equal(risk_data['current_asset'], 6811322, 'risk current asset')
         assert_equal(risk_data['holding_ratios'][0]['symbol'], 'NET', 'risk top holding')

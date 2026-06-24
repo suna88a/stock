@@ -150,6 +150,29 @@ def format_percent(value, signed=False):
     return f"{sign}{value * 100:.1f}%"
 
 
+def daily_value_icon(value, risk=False):
+    if value is None or value == 0:
+        return ''
+    if risk:
+        return '🟡 '
+    return '🔴 ' if value > 0 else '🟢 '
+
+
+def format_daily_signed_money(amount, currency='JPY', risk=False):
+    if amount is None:
+        return '-'
+    return f"{daily_value_icon(amount, risk=risk)}{format_signed_money(amount, currency)}"
+
+
+def format_daily_asset_change(change_info):
+    change = change_info.get('change')
+    rate = change_info.get('change_rate')
+    currency = change_info.get('currency') or 'JPY'
+    if change is None or rate is None:
+        return '-'
+    return f"{format_daily_signed_money(change, currency)} ({format_rate(rate)})"
+
+
 def position_currency(item):
     return (item.get('current_currency') or item.get('currency') or 'USD').upper()
 
@@ -1118,7 +1141,7 @@ def format_daily_risk_summary(risk):
         lines.append(f"{top_scenario['symbol']} 下落影響")
         for scenario in top_scenario['scenarios']:
             lines.append(
-                f"-{scenario['decline_rate'] * 100:.0f}% {format_signed_money(-scenario['loss'])} "
+                f"-{scenario['decline_rate'] * 100:.0f}% {format_daily_signed_money(-scenario['loss'], risk=True)} "
                 f"/ {format_percent(-scenario['impact_rate'], signed=True)}"
             )
     else:
@@ -1327,15 +1350,13 @@ def build_daily_report_embeds(report_data):
         name="資産サマリー",
         value=(
             f"現在 {format_money(report_data['current_asset'])}\n"
-            f"前回 {format_asset_change(report_data['asset_change'])}\n"
+            f"前回 {format_daily_asset_change(report_data['asset_change'])}\n"
             f"基準 {format_money(report_data['initial_asset'])}\n"
-            f"入金 {format_money(report_data['cash_flow']['deposit_total'])}\n"
-            f"出金 {format_money(report_data['cash_flow']['withdraw_total'])}\n"
-            f"純入金 {format_money(report_data['cash_flow']['net_deposit'])}\n"
-            f"成果 {format_money(report_data['operation_result'])}\n"
-            f"除外R {report_data['return_rate']:+.2f}%\n"
+            "\n"
+            f"成果 {format_daily_signed_money(report_data['operation_result'])}\n"
+            "\n"
             f"目標 {format_money(report_data['target_amount'])}\n"
-            f"差分 {format_money(report_data['target_diff'])}"
+            f"差分 {format_daily_signed_money(report_data['target_diff'])}"
         ),
         inline=False,
     )
