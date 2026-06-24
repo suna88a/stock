@@ -136,6 +136,13 @@ def format_asset_change(change_info):
     return f"{format_signed_money(change, currency)} ({format_rate(rate)})"
 
 
+def format_percent(value, signed=False):
+    if value is None:
+        return '-'
+    sign = '+' if signed and value >= 0 else ''
+    return f"{sign}{value * 100:.1f}%"
+
+
 def position_currency(item):
     return (item.get('current_currency') or item.get('currency') or 'USD').upper()
 
@@ -852,6 +859,200 @@ def create_asset_embed(user_id, total_asset=None):
     return embed
 
 
+def estimate_holding_value_jpy(holding):
+    value_jpy = holding.get('current_value_jpy')
+    if value_jpy is not None:
+        return value_jpy, False
+
+    quantity = holding.get('quantity') or 0
+    price = holding.get('current_price')
+    if price is None:
+        price = holding.get('purchase_price')
+    currency = (holding.get('current_currency') or holding.get('currency') or 'JPY').upper()
+    if price is None:
+        return None, True
+    if currency == 'JPY':
+        return quantity * price, True
+    return None, True
+
+
+def build_portfolio_risk_data(user_id, database=None):
+    database = database or db
+    asset_info = database.get_asset(user_id)
+    current_asset = asset_info['total_asset'] if asset_info else 0
+    holdings = database.get_holdings(user_id)
+    breakdowns = database.get_asset_breakdowns(user_id)
+
+    holding_ratios = []
+    approximate = False
+    for holding in holdings:
+        value_jpy, is_approx = estimate_holding_value_jpy(holding)
+        if value_jpy is None:
+            approximate = True
+            continue
+        approximate = approximate or is_approx
+        ratio = value_jpy / current_asset if current_asset else 0
+        holding_ratios.append({
+            'symbol': holding['symbol'],
+            'value_jpy': value_jpy,
+            'ratio': ratio,
+            'approximate': is_approx,
+        })
+    holding_ratios.sort(key=lambda item: item['value_jpy'], reverse=True)
+
+    breakdown_ratios = []
+    for item in breakdowns:
+        amount = item.get('amount') or 0
+        ratio = amount / current_asset if current_asset else 0
+        breakdown_ratios.append({
+            'name': item['name'],
+            'amount': amount,
+            'currency': item.get('currency') or 'JPY',
+            'ratio': ratio,
+        })
+    breakdown_ratios.sort(key=lambda item: item['amount'], reverse=True)
+
+    breakdown_amounts = {item['name']: item.get('amount') or 0 for item in breakdowns}
+    cash_amount = sum(
+        amount for name, amount in breakdown_amounts.items()
+        if name in {'預り金', 'USドル'}
+    )
+    cash_ratio = cash_amount / current_asset if current_asset else 0
+
+    jpy_names = {'国内株式', '投資信託', '投信', '預り金'}
+    usd_names = {'米国株式', 'USドル'}
+    jpy_amount = sum(amount for name, amount in breakdown_amounts.items() if name in jpy_names)
+    usd_amount = sum(amount for name, amount in breakdown_amounts.items() if name in usd_names)
+    other_amount = max(0, sum(breakdown_amounts.values()) - jpy_amount - usd_amount)
+
+    decline_rates = [0.2, 0.4, 0.6]
+    decline_scenarios = []
+    for item in holding_ratios[:3]:
+        scenarios = []
+        for decline_rate in decline_rates:
+            loss = item['value_jpy'] * decline_rate
+            impact_rate = loss / current_asset if current_asset else 0
+            scenarios.append({
+                'decline_rate': decline_rate,
+                'loss': loss,
+                'impact_rate': impact_rate,
+            })
+        decline_scenarios.append({
+            'symbol': item['symbol'],
+            'value_jpy': item['value_jpy'],
+            'scenarios': scenarios,
+        })
+
+    return {
+        'current_asset': current_asset,
+        'holding_ratios': holding_ratios,
+        'breakdown_ratios': breakdown_ratios,
+        'cash_amount': cash_amount,
+        'cash_ratio': cash_ratio,
+        'currency_amounts': {
+            'JPY': jpy_amount,
+            'USD': usd_amount,
+            'その他': other_amount,
+        },
+        'decline_scenarios': decline_scenarios,
+        'approximate': approximate,
+    }
+
+
+def create_risk_embed(user_id):
+    risk = build_portfolio_risk_data(user_id)
+    current_asset = risk['current_asset']
+    embed = discord.Embed(title="ポートフォリオ・リスク管理", color=discord.Color.orange())
+    embed.add_field(name="現在資産", value=format_money(current_asset), inline=False)
+
+    if risk['holding_ratios']:
+        lines = []
+        for item in risk['holding_ratios'][:10]:
+            approx = "（概算）" if item.get('approximate') else ""
+            lines.append(
+                f"{item['symbol']}: {format_money(item['value_jpy'])} / {format_percent(item['ratio'])}{approx}"
+            )
+        embed.add_field(name="銘柄別保有比率", value='\n'.join(lines)[:1000], inline=False)
+    else:
+        embed.add_field(name="銘柄別保有比率", value="保有銘柄の円換算評価額がありません。`/更新` 後に再確認してください。", inline=False)
+
+    if risk['breakdown_ratios']:
+        lines = [
+            f"{item['name']}: {format_money(item['amount'], item['currency'])} / {format_percent(item['ratio'])}"
+            for item in risk['breakdown_ratios']
+        ]
+        embed.add_field(name="資産内訳比率", value='\n'.join(lines)[:1000], inline=False)
+    else:
+        embed.add_field(name="資産内訳比率", value="資産内訳が登録されていません。", inline=False)
+
+    embed.add_field(
+        name="現金比率",
+        value=f"{format_money(risk['cash_amount'])} / {format_percent(risk['cash_ratio'])}",
+        inline=False,
+    )
+
+    currency_lines = []
+    for currency, amount in risk['currency_amounts'].items():
+        if amount <= 0:
+            continue
+        ratio = amount / current_asset if current_asset else 0
+        currency_lines.append(f"{currency}: {format_money(amount)} / {format_percent(ratio)}")
+    embed.add_field(name="通貨別比率", value='\n'.join(currency_lines) if currency_lines else "-", inline=False)
+
+    if risk['decline_scenarios']:
+        lines = []
+        for item in risk['decline_scenarios']:
+            for scenario in item['scenarios']:
+                lines.append(
+                    f"{item['symbol']} -{scenario['decline_rate'] * 100:.0f}% → "
+                    f"資産 -{scenario['impact_rate'] * 100:.1f}% / {format_signed_money(-scenario['loss'])}"
+                )
+        embed.add_field(name="主力銘柄の下落シミュレーション", value='\n'.join(lines)[:1000], inline=False)
+    else:
+        embed.add_field(name="主力銘柄の下落シミュレーション", value="対象銘柄がありません。", inline=False)
+
+    footer = "売買推奨ではなく、集中度と下落耐性の可視化です。"
+    if risk['approximate']:
+        footer += " current_value_jpy がない銘柄は取得単価ベースの概算または除外です。"
+    embed.set_footer(text=footer)
+    return embed
+
+
+def format_daily_risk_summary(risk):
+    current_asset = risk.get('current_asset') or 0
+    lines = []
+    top_holding = risk.get('holding_ratios', [None])[0]
+    if top_holding:
+        approx = "（概算）" if top_holding.get('approximate') else ""
+        lines.append(
+            f"最大保有: {top_holding['symbol']} {format_money(top_holding['value_jpy'])} "
+            f"/ {format_percent(top_holding['ratio'])}{approx}"
+        )
+    else:
+        lines.append("最大保有: -")
+
+    lines.append(f"現金比率: {format_money(risk.get('cash_amount'))} / {format_percent(risk.get('cash_ratio'))}")
+
+    currency_amounts = risk.get('currency_amounts') or {}
+    jpy_amount = currency_amounts.get('JPY') or 0
+    usd_amount = currency_amounts.get('USD') or 0
+    jpy_ratio = jpy_amount / current_asset if current_asset else 0
+    usd_ratio = usd_amount / current_asset if current_asset else 0
+    lines.append(f"通貨比率: JPY {format_percent(jpy_ratio)} / USD {format_percent(usd_ratio)}")
+
+    top_scenario = risk.get('decline_scenarios', [None])[0]
+    if top_scenario:
+        scenario_texts = [
+            f"-{scenario['decline_rate'] * 100:.0f}% → {format_signed_money(-scenario['loss'])} "
+            f"({format_percent(-scenario['impact_rate'], signed=True)})"
+            for scenario in top_scenario['scenarios']
+        ]
+        lines.append(f"{top_scenario['symbol']} 下落影響: " + " / ".join(scenario_texts))
+    else:
+        lines.append("下落影響: -")
+    return '\n'.join(lines)
+
+
 async def update_market_prices(user_id):
     """保有・試算の価格を取得してDBに反映する。current_assetsは更新しない。"""
     holdings = db.get_holdings(user_id)
@@ -1005,6 +1206,7 @@ def build_daily_report_data(user_id, update_result=None):
         'breakdowns': db.get_asset_breakdowns(user_id),
         'holdings': db.get_holdings(user_id),
         'simulations': db.get_simulations(user_id),
+        'risk_data': build_portfolio_risk_data(user_id),
         'update_result': update_result or {},
         'generated_at': now_jst(),
     }
@@ -1038,6 +1240,9 @@ def build_daily_report_embeds(report_data):
         for item in report_data['breakdowns']
     ]
     summary.add_field(name="資産内訳", value=_truncate_lines(breakdown_lines), inline=False)
+    risk_data = report_data.get('risk_data')
+    if risk_data:
+        summary.add_field(name="リスク概要", value=format_daily_risk_summary(risk_data)[:1000], inline=False)
     summary.add_field(
         name="更新情報",
         value=(
@@ -1459,6 +1664,15 @@ async def show_goal(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
+@tree.command(name="リスク", description="ポートフォリオの集中度・現金比率・通貨比率を表示します")
+async def show_risk(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+    try:
+        await interaction.followup.send(embed=create_risk_embed(interaction.user.id))
+    except Exception as exc:
+        await interaction.followup.send(f"リスク表示中にエラーが発生しました: {exc}")
+
+
 @tree.command(name="レビュー", description="取引台帳ベースのレビューを表示します")
 async def show_review(interaction: discord.Interaction):
     await interaction.response.defer(thinking=True)
@@ -1615,6 +1829,7 @@ async def help_command(interaction: discord.Interaction):
         ("/試算削除 銘柄", "試算ポジションを削除します"),
         ("/更新", "保有・試算の現在価格と前日比を自動取得して評価損益を更新します"),
         ("/レビュー", "年20%目標に対する運用成果を確認します"),
+        ("/リスク", "銘柄集中度・資産内訳・現金比率・通貨比率・下落影響を確認します"),
         ("/シナリオ登録 銘柄コード", "投資シナリオ登録用のModalを開きます"),
         ("/シナリオ確認 銘柄コード", "有効な投資シナリオを確認します"),
         ("/シナリオ一覧", "activeな投資シナリオを一覧表示します"),

@@ -7,7 +7,7 @@ from config import BASE_ASSET, BASE_DATE
 from database import InvestmentDatabase
 from price_fetcher import normalize_ticker
 from time_utils import format_datetime_jst
-from bot import build_daily_report_embeds
+from bot import build_daily_report_embeds, build_portfolio_risk_data
 
 
 def assert_equal(actual, expected, label):
@@ -111,6 +111,7 @@ def main():
         holding = db.get_holding_by_symbol(user_id, 'NET')
         assert_equal(holding['quantity'], 15, 'sell subtracts quantity')
         assert_close(sell_result['realized_profit'], 100, 'sell realized profit')
+        db.update_holding_valuation(user_id, 'NET', 250, 'USD', usdjpy=157.2, previous_close=240)
 
         before_asset = db.get_asset(user_id)['total_asset']
         db.add_simulation(user_id, 'SOFI', 300, 8.5, 'USD', 'AIテーマ監視')
@@ -125,6 +126,7 @@ def main():
 
         assert_equal(format_datetime_jst('2026-06-18 15:22:19'), '2026-06-19 00:22:19', 'jst formatting')
 
+        risk_data = build_portfolio_risk_data(user_id, db)
         report_data = {
             'current_asset': 6811322,
             'initial_asset': BASE_ASSET,
@@ -140,12 +142,24 @@ def main():
             ],
             'holdings': [db.get_holding_by_symbol(user_id, 'NET')],
             'simulations': db.get_simulations(user_id),
+            'risk_data': risk_data,
             'update_result': {'usdjpy': 157.2, 'failed': []},
             'generated_at': BASE_DATE,
         }
         embeds = build_daily_report_embeds(report_data)
         assert_equal(len(embeds), 3, 'daily report embed count')
         assert_equal(embeds[0].title, '📊 日次資産レポート', 'daily report title')
+        assert_equal(any(field.name == 'リスク概要' for field in embeds[0].fields), True, 'daily report risk summary')
+
+        assert_equal(risk_data['current_asset'], 6811322, 'risk current asset')
+        assert_equal(risk_data['holding_ratios'][0]['symbol'], 'NET', 'risk top holding')
+        assert_close(risk_data['cash_amount'], 381645 + 35132, 'risk cash amount')
+        assert_close(risk_data['cash_ratio'], (381645 + 35132) / 6811322, 'risk cash ratio')
+        assert_close(risk_data['currency_amounts']['JPY'], 994000 + 2404885 + 381645, 'risk jpy amount')
+        assert_close(risk_data['currency_amounts']['USD'], 2995660 + 35132, 'risk usd amount')
+        net_decline = risk_data['decline_scenarios'][0]['scenarios'][0]
+        assert_close(net_decline['loss'], risk_data['holding_ratios'][0]['value_jpy'] * 0.2, 'risk decline loss')
+        assert_close(net_decline['impact_rate'], net_decline['loss'] / 6811322, 'risk decline impact')
 
         legacy_user_id = 67890
         conn = sqlite3.connect(db_path)
