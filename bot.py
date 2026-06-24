@@ -2,7 +2,7 @@
 import asyncio
 import os
 import re
-from datetime import datetime, time as datetime_time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -23,6 +23,7 @@ intents = discord.Intents.default()
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
 db = InvestmentDatabase()
+daily_report_last_sent_date = None
 
 
 @bot.event
@@ -31,27 +32,54 @@ async def on_ready():
     print(f'{bot.user} としてログインしました')
     await tree.sync()
     print('コマンドを同期しました')
+    print(f"[daily_report] DAILY_REPORT_CHANNEL_ID set={bool(DAILY_REPORT_CHANNEL_ID)}")
     if DAILY_REPORT_CHANNEL_ID:
         if not daily_report_loop.is_running():
             daily_report_loop.start()
-            print(f"[daily_report] scheduler started channel_id={DAILY_REPORT_CHANNEL_ID}")
+            print("[daily_report] 日次レポートスケジューラー開始")
+            print(f"[daily_report] 投稿先チャンネルID {DAILY_REPORT_CHANNEL_ID}")
+            print(f"[daily_report] 次回実行予定時刻 {get_next_daily_report_time().strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        else:
+            print("[daily_report] scheduler already running")
     else:
-        print("[daily_report] DAILY_REPORT_CHANNEL_ID is not set; scheduler disabled")
+        print("[daily_report] DAILY_REPORT_CHANNEL_ID is not set; 日次レポート無効")
 
 
-@tasks.loop(time=datetime_time(hour=7, minute=0, tzinfo=JST))
+@tasks.loop(minutes=1)
 async def daily_report_loop():
-    print("[daily_report] scheduled trigger")
+    global daily_report_last_sent_date
+    current = now_jst()
+    if not (current.hour == 7 and current.minute in (0, 1)):
+        return
+    if daily_report_last_sent_date == current.date():
+        return
+
+    print("[daily_report] 日次レポート開始")
     channel_id = int(DAILY_REPORT_CHANNEL_ID) if DAILY_REPORT_CHANNEL_ID.isdigit() else None
     if not channel_id:
-        print("[daily_report] DAILY_REPORT_CHANNEL_ID is invalid or empty")
+        print("[daily_report] DAILY_REPORT_CHANNEL_ID is invalid or empty; 日次レポート無効")
         return
     print(f"[daily_report] 投稿先チャンネルID {channel_id}")
     try:
         channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
         await send_daily_report(channel)
+        daily_report_last_sent_date = current.date()
+        print("[daily_report] 投稿成功")
     except Exception as exc:
         print(f"[daily_report] 投稿失敗: {exc}")
+
+
+@daily_report_loop.before_loop
+async def before_daily_report_loop():
+    await bot.wait_until_ready()
+
+
+def get_next_daily_report_time():
+    current = now_jst()
+    next_run = current.replace(hour=7, minute=0, second=0, microsecond=0)
+    if current >= next_run:
+        next_run = next_run + timedelta(days=1)
+    return next_run
 
 
 def format_money(amount, currency='JPY'):
