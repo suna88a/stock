@@ -13,6 +13,20 @@ DISCORD_TOKEN = os.getenv('DISCORD_TOKEN', 'your_token_here')
 DAILY_REPORT_CHANNEL_ID = os.getenv('DAILY_REPORT_CHANNEL_ID', '').strip()
 DAILY_REPORT_USER_ID = os.getenv('DAILY_REPORT_USER_ID', '').strip()
 
+
+def _env_int(name, default, minimum, maximum):
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    if minimum <= value <= maximum:
+        return value
+    return default
+
+
+DAILY_REPORT_HOUR = _env_int('DAILY_REPORT_HOUR', 7, 0, 23)
+DAILY_REPORT_MINUTE = _env_int('DAILY_REPORT_MINUTE', 0, 0, 59)
+
 # 投資管理設定
 BASE_DATE = datetime(2026, 6, 9)  # 基準日
 BASE_ASSET = 7_096_249  # 基準資産（円）

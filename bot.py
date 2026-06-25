@@ -10,7 +10,16 @@ import discord
 from discord import app_commands
 from discord.ext import tasks
 
-from config import DISCORD_TOKEN, DAILY_REPORT_CHANNEL_ID, DAILY_REPORT_USER_ID, BASE_ASSET, ANNUAL_TARGET, BASE_DATE
+from config import (
+    DISCORD_TOKEN,
+    DAILY_REPORT_CHANNEL_ID,
+    DAILY_REPORT_USER_ID,
+    DAILY_REPORT_HOUR,
+    DAILY_REPORT_MINUTE,
+    BASE_ASSET,
+    ANNUAL_TARGET,
+    BASE_DATE,
+)
 from database import InvestmentDatabase
 from price_fetcher import fetch_quote, fetch_usdjpy
 from time_utils import JST, format_datetime_jst, now_jst
@@ -23,7 +32,7 @@ intents = discord.Intents.default()
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
 db = InvestmentDatabase()
-daily_report_last_sent_date = None
+daily_report_last_sent_key = None
 DEFAULT_TICKER_NAMES = {
     '4633': 'サカタインクス',
     '4755': '楽天グループ',
@@ -40,6 +49,7 @@ async def on_ready():
     await tree.sync()
     print('コマンドを同期しました')
     print(f"[daily_report] DAILY_REPORT_CHANNEL_ID set={bool(DAILY_REPORT_CHANNEL_ID)}")
+    print(f"[daily_report] 通知時刻 JST {DAILY_REPORT_HOUR:02d}:{DAILY_REPORT_MINUTE:02d}")
     if DAILY_REPORT_CHANNEL_ID:
         if not daily_report_loop.is_running():
             daily_report_loop.start()
@@ -54,11 +64,18 @@ async def on_ready():
 
 @tasks.loop(minutes=1)
 async def daily_report_loop():
-    global daily_report_last_sent_date
+    global daily_report_last_sent_key
     current = now_jst()
-    if not (current.hour == 7 and current.minute in (0, 1)):
+    scheduled = current.replace(
+        hour=DAILY_REPORT_HOUR,
+        minute=DAILY_REPORT_MINUTE,
+        second=0,
+        microsecond=0,
+    )
+    if current < scheduled or current >= scheduled + timedelta(minutes=2):
         return
-    if daily_report_last_sent_date == current.date():
+    scheduled_key = scheduled.strftime('%Y-%m-%d %H:%M')
+    if daily_report_last_sent_key == scheduled_key:
         return
 
     print("[daily_report] 日次レポート開始")
@@ -70,10 +87,10 @@ async def daily_report_loop():
     try:
         channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
         await send_daily_report(channel)
-        daily_report_last_sent_date = current.date()
+        daily_report_last_sent_key = scheduled_key
         print("[daily_report] 投稿成功")
     except Exception as exc:
-        print(f"[daily_report] 投稿失敗: {exc}")
+        print(f"[daily_report] 投稿失敗 key={scheduled_key}: {exc}")
 
 
 @daily_report_loop.before_loop
@@ -83,7 +100,7 @@ async def before_daily_report_loop():
 
 def get_next_daily_report_time():
     current = now_jst()
-    next_run = current.replace(hour=7, minute=0, second=0, microsecond=0)
+    next_run = current.replace(hour=DAILY_REPORT_HOUR, minute=DAILY_REPORT_MINUTE, second=0, microsecond=0)
     if current >= next_run:
         next_run = next_run + timedelta(days=1)
     return next_run
