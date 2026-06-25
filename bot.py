@@ -243,8 +243,8 @@ def format_report_price(amount, currency):
 
 def format_daily_position_row(label, value, rate=None):
     if rate is None:
-        return f"{label} {value}"
-    return f"{label} {value} / {rate}"
+        return f"{label}   {value}"
+    return f"{label}   {value} / {rate}"
 
 
 def daily_day_change_jpy(item, usdjpy=None):
@@ -282,7 +282,7 @@ def format_daily_holding_value(item, usdjpy=None):
         format_daily_position_row('前日', format_daily_signed_money(day_change_jpy) if day_change_jpy is not None else '-', day_rate),
         format_daily_position_row('損益', format_daily_signed_money(pnl_jpy) if pnl_jpy is not None else '-', f"{pnl_rate:+.2f}%" if pnl_rate is not None else '-'),
     ]
-    return "\n".join(lines)
+    return "```text\n" + "\n".join(lines) + "\n```"
 
 
 def clean_number(value):
@@ -1134,24 +1134,18 @@ def format_daily_risk_summary(risk):
     top_holding = risk.get('holding_ratios', [None])[0]
     if top_holding:
         approx = "（概算）" if top_holding.get('approximate') else ""
-        lines.append(
-            f"最大 {top_holding['symbol']}"
-        )
-        lines.append(
-            f"{format_money(top_holding['value_jpy'])} / {format_percent(top_holding['ratio'])}{approx}"
-        )
+        lines.append(f"最大 {top_holding['symbol']} {format_percent(top_holding['ratio'])}{approx}")
     else:
         lines.append("最大 -")
 
-    lines.append("")
-    lines.append(f"現金 {format_money(risk.get('cash_amount'))} / {format_percent(risk.get('cash_ratio'))}")
+    lines.append(f"現金 {format_percent(risk.get('cash_ratio'))}")
 
     currency_amounts = risk.get('currency_amounts') or {}
     jpy_amount = currency_amounts.get('JPY') or 0
     usd_amount = currency_amounts.get('USD') or 0
     jpy_ratio = jpy_amount / current_asset if current_asset else 0
     usd_ratio = usd_amount / current_asset if current_asset else 0
-    lines.append(f"通貨 JPY {format_percent(jpy_ratio)} / USD {format_percent(usd_ratio)}")
+    lines.append(f"JPY {format_percent(jpy_ratio)} / USD {format_percent(usd_ratio)}")
 
     top_scenario = risk.get('decline_scenarios', [None])[0]
     if top_scenario:
@@ -1281,10 +1275,7 @@ def format_daily_asset_summary(report_data):
     return (
         f"現在 {format_money(report_data['current_asset'])}\n"
         f"前回 {format_daily_asset_change(report_data['asset_change'])}\n"
-        f"基準 {format_money(report_data['initial_asset'])}\n"
-        "\n"
         f"成果 {format_daily_signed_money(report_data['operation_result'])}\n"
-        f"目標 {format_money(report_data['target_amount'])}\n"
         f"差分 {format_daily_signed_money(report_data['target_diff'])}"
     )
 
@@ -1316,29 +1307,18 @@ def _build_daily_holding_embeds(items, usdjpy=None):
         return [embed]
 
     embeds = []
-    current_blocks = []
-    current_length = 0
-    for item in items:
-        block = format_daily_holding_value(item, usdjpy=usdjpy)
-        block_length = len(block) + 2
-        if current_blocks and current_length + block_length > 3800:
-            suffix = f" {len(embeds) + 1}" if embeds else ""
-            embeds.append(discord.Embed(
-                title=f"保有銘柄{suffix}",
-                description="\n\n".join(current_blocks),
-                color=discord.Color.green(),
-            ))
-            current_blocks = []
-            current_length = 0
-        current_blocks.append(block)
-        current_length += block_length
-    if current_blocks:
-        suffix = f" {len(embeds) + 1}" if embeds else ""
-        embeds.append(discord.Embed(
-            title=f"保有銘柄{suffix}",
-            description="\n\n".join(current_blocks),
-            color=discord.Color.green(),
-        ))
+    for index in range(0, len(items), 25):
+        chunk = items[index:index + 25]
+        suffix = f" {index // 25 + 1}" if index else ""
+        embed = discord.Embed(title=f"保有銘柄{suffix}", color=discord.Color.green())
+        embed.description = "\u200b"
+        for item in chunk:
+            embed.add_field(
+                name=holding_display_name(item),
+                value=format_daily_holding_value(item, usdjpy=usdjpy)[:1024],
+                inline=False,
+            )
+        embeds.append(embed)
     return embeds
 
 
@@ -1407,8 +1387,6 @@ def build_daily_report_embeds(report_data):
     )
     embeds.append(summary)
 
-    embeds.extend(_build_daily_holding_embeds(report_data['holdings'], usdjpy=usdjpy))
-
     breakdown_lines = [
         f"{item['name']}: {format_money(item['amount'], item['currency'])}"
         for item in report_data['breakdowns']
@@ -1427,6 +1405,8 @@ def build_daily_report_embeds(report_data):
         description=info_text[:4096],
         color=discord.Color.blue(),
     ))
+
+    embeds.extend(_build_daily_holding_embeds(report_data['holdings'], usdjpy=usdjpy))
 
     embeds.extend(_build_position_embeds(
         "試算",
